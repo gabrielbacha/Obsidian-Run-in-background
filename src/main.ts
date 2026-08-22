@@ -75,8 +75,8 @@ export default class RunInBackgroundPlugin extends Plugin {
     };
     window.on("ready-to-show", hidePicker);
     window.on("show", hidePicker);
-    globalThis.setTimeout(hidePicker, 0);
-    globalThis.setTimeout(() => {
+    window.setTimeout(hidePicker, 0);
+    window.setTimeout(() => {
       hidePicker();
       this.appActivated();
     }, 150);
@@ -353,7 +353,7 @@ class TraySettingsTab extends PluginSettingTab {
     const setting = new Setting(this.containerEl)
       .setName("Tray icon image")
       .setDesc("Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.");
-    setting.controlEl.style.gap = "8px";
+    setting.controlEl.setCssStyles({ gap: "8px" });
     const presetButtons: HTMLButtonElement[] = [];
     const selectedPreset = (): string | undefined =>
       TRAY_ICON_PRESETS.find((preset) => preset.dataUrl === this.plugin.settings.trayIconImage)?.id;
@@ -363,23 +363,19 @@ class TraySettingsTab extends PluginSettingTab {
         const active = button.dataset.preset === selected;
         button.classList.toggle("mod-cta", active);
         button.setAttribute("aria-pressed", String(active));
-        button.style.boxShadow = active ? "0 0 0 2px var(--interactive-accent)" : "none";
+        button.setCssStyles({ boxShadow: active ? "0 0 0 2px var(--interactive-accent)" : "none" });
       }
     };
     for (const preset of TRAY_ICON_PRESETS) {
       const button = setting.controlEl.createEl("button", { cls: "clickable-icon", attr: { "aria-label": preset.name, title: preset.name } });
       button.dataset.preset = preset.id;
-      button.style.width = "40px";
-      button.style.height = "40px";
-      button.style.borderRadius = "8px";
+      button.setCssStyles({ width: "40px", height: "40px", borderRadius: "8px" });
       const image = button.createEl("img", { attr: { src: preset.dataUrl, alt: preset.name } });
-      image.style.width = "30px";
-      image.style.height = "30px";
-      image.style.objectFit = "contain";
+      image.setCssStyles({ width: "30px", height: "30px", objectFit: "contain" });
       presetButtons.push(button);
       button.addEventListener("click", () => {
         this.plugin.settings.trayIconImage = preset.dataUrl;
-        customPreview.style.display = "none";
+        customPreview.setCssStyles({ display: "none" });
         refreshSelection();
         void this.commit(() => this.plugin.createTray());
       });
@@ -388,11 +384,9 @@ class TraySettingsTab extends PluginSettingTab {
       attr: { src: selectedPreset() ? "" : this.plugin.settings.trayIconImage, alt: "Uploaded custom icon" },
     });
     this.stylePreview(customPreview);
-    customPreview.style.display = selectedPreset() ? "none" : "block";
-    setting.addButton((button) => button.setButtonText("Upload your own").setTooltip("Upload a custom icon").onClick(() => {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = "image/*";
+    customPreview.setCssStyles({ display: selectedPreset() ? "none" : "block" });
+    setting.addButton((button) => button.setButtonText("Upload your own").onClick(() => {
+      const input = createEl("input", { attr: { type: "file", accept: "image/*" } });
       input.onchange = () => {
         const file = input.files?.[0];
         if (!file) return;
@@ -401,7 +395,7 @@ class TraySettingsTab extends PluginSettingTab {
           if (typeof reader.result !== "string") return;
           this.plugin.settings.trayIconImage = reader.result;
           customPreview.src = reader.result;
-          customPreview.style.display = "block";
+          customPreview.setCssStyles({ display: "block" });
           refreshSelection();
           void this.commit(async () => {
             await this.plugin.createTray();
@@ -444,10 +438,12 @@ class TraySettingsTab extends PluginSettingTab {
   }
 
   private stylePreview(preview: HTMLImageElement, size = 32): void {
-    preview.style.width = `${size}px`;
-    preview.style.height = `${size}px`;
-    preview.style.objectFit = "contain";
-    preview.style.imageRendering = "auto";
+    preview.setCssStyles({
+      width: `${size}px`,
+      height: `${size}px`,
+      objectFit: "contain",
+      imageRendering: "auto",
+    });
   }
 
   private toggle(

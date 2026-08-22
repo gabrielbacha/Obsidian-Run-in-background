@@ -48,7 +48,7 @@ export function badgeTextColor(background: string): "#000000" | "#ffffff" {
 }
 
 function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgroundColor: string, pixelSize: number): string {
-  const canvas = document.createElement("canvas");
+  const canvas = createEl("canvas");
   canvas.width = pixelSize;
   canvas.height = pixelSize;
   const context = canvas.getContext("2d");
