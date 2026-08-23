@@ -59,7 +59,9 @@ function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgro
   context.drawImage(image, (pixelSize - width) / 2, (pixelSize - height) / 2, width, height);
   if (badge) {
     const scale = pixelSize / 16;
-    const badgeWidth = (badge.length === 1 ? 8 : 13) * scale;
+    const visibleCharacters = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(badge)]
+      .filter(({ segment }) => !/^\s+$/u.test(segment)).length;
+    const badgeWidth = (visibleCharacters === 1 ? 8 : visibleCharacters === 2 ? 13 : 16) * scale;
     const badgeHeight = 8 * scale;
     const x = pixelSize - badgeWidth;
     const y = pixelSize - badgeHeight;
@@ -68,7 +70,7 @@ function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgro
     context.roundRect(x, y, badgeWidth, badgeHeight, 2 * scale);
     context.fill();
     context.fillStyle = badgeTextColor(badgeBackgroundColor);
-    context.font = `700 ${badge.length === 1 ? 6.5 : 5.5}px system-ui, sans-serif`;
+    context.font = `700 ${visibleCharacters === 1 ? 6.5 : visibleCharacters === 2 ? 5.5 : 4}px system-ui, sans-serif`;
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.scale(scale, scale);

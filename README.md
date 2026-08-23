@@ -21,7 +21,7 @@ Obsidian Sync and cannot sync while the computer is asleep or offline.
 - Optionally make Cmd+Q or the normal Quit command hide instead of terminate.
 - Always allow explicit Close Vault, Relaunch, logout, restart, and shutdown.
 - Distinguish vaults with custom icons and optional colored text, number,
-  symbol, or emoji badges.
+  symbol, or emoji badges of up to three characters.
 - Open the plugin settings directly from the tray menu.
 - Import compatible settings from the original Tray plugin on first launch.
 
@@ -45,6 +45,7 @@ Quit command can be configured independently.
 
 | Setting | Description | New-install default |
 | --- | --- | --- |
+| Enable Run in Background | Master switch for all plugin runtime behavior | On |
 | Launch on startup | Launch Obsidian when you sign in | Off |
 | Hide on launch | Start the vault hidden | On |
 | Run in background | Hide an ordinary window close | On |
@@ -52,14 +53,13 @@ Quit command can be configured independently.
 | Hide Dock/taskbar icon | Remove Obsidian from the Dock or taskbar | Off |
 | Create tray icon | Create the vault menu-bar or tray icon | On |
 | Tray icon image | Select a preset or upload a square PNG/SVG | Obsidian |
-| Vault badge | Add up to two characters, optionally separated by a space | Vault initials |
+| Vault badge | Add up to three characters, optionally separated by spaces | Vault initials |
 | Badge color | Set a vault-specific badge background with automatic contrast | Dark |
-| Enable Run in Background | Master switch for all plugin runtime behavior | On |
 
 For safety, hiding the Dock/taskbar icon keeps the tray icon enabled. Disabling
 the tray icon restores the Dock/taskbar icon.
 
-The final **Enable Run in Background** switch deactivates the entire runtime
+The top **Enable Run in Background** switch deactivates the entire runtime
 without disabling the community plugin. While it is off, no close or Quit
 behavior, tray icon, Dock/taskbar changes, or launch-at-login behavior remains
 active; the settings page stays available so you can turn it back on.
@@ -83,7 +83,7 @@ gabrielbacha/run-in-background
 
 ### Manual installation
 
-Download `main.js` and `manifest.json` from a matching
+Download `main.js`, `manifest.json`, and `styles.css` from a matching
 [GitHub release](https://github.com/gabrielbacha/run-in-background/releases),
 then place them in:
 

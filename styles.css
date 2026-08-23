@@ -1,0 +1,11 @@
+.run-in-background-master-switch {
+  margin-bottom: 20px;
+  padding: 14px;
+  border: 2px dashed var(--color-red);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--color-red) 8%, transparent);
+}
+
+.run-in-background-master-switch .setting-item-name {
+  font-weight: var(--font-semibold);
+}

@@ -6,15 +6,15 @@ describe("vault badges", () => {
     "derives %s as %s", (vault, badge) => expect(deriveVaultBadge(vault)).toBe(badge),
   );
 
-  it("accepts two letters, numbers, symbols, or emoji", () => {
-    expect(normalizeVaultBadge("gbx")).toBe("GB");
-    expect(normalizeVaultBadge("g2x")).toBe("G2");
-    expect(normalizeVaultBadge("★!")).toBe("★!");
-    expect(normalizeVaultBadge("🔥2x")).toBe("🔥2");
+  it("accepts up to three letters, numbers, symbols, or emoji", () => {
+    expect(normalizeVaultBadge("gbxy")).toBe("GBX");
+    expect(normalizeVaultBadge("g2!x")).toBe("G2!");
+    expect(normalizeVaultBadge("★!?x")).toBe("★!?");
+    expect(normalizeVaultBadge("🔥2★x")).toBe("🔥2★");
   });
 
-  it("preserves one optional internal space and trims empty whitespace", () => {
-    expect(normalizeVaultBadge(" g   b ")).toBe("G B");
+  it("preserves optional internal spaces and trims empty whitespace", () => {
+    expect(normalizeVaultBadge(" g   b   c ")).toBe("G B C");
     expect(normalizeVaultBadge("   ")).toBe("");
   });
 

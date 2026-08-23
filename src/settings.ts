@@ -24,10 +24,10 @@ export function normalizeVaultBadge(value: string): string {
   let pendingSpace = false;
   for (const segment of segments) {
     if (/^\s+$/u.test(segment)) {
-      if (visibleCharacters > 0 && visibleCharacters < 2) pendingSpace = true;
+      if (visibleCharacters > 0 && visibleCharacters < 3) pendingSpace = true;
       continue;
     }
-    if (visibleCharacters >= 2) break;
+    if (visibleCharacters >= 3) break;
     if (pendingSpace) normalized.push(" ");
     normalized.push(segment.toLocaleUpperCase());
     visibleCharacters += 1;

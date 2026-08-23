@@ -376,6 +376,7 @@ class TraySettingsTab extends PluginSettingTab {
 
   override display(): void {
     this.containerEl.empty();
+    this.masterSwitch();
     new Setting(this.containerEl).setName("Window management").setHeading();
     this.toggle("Launch on startup", "Open Obsidian when you log in.", "launchOnStartup", undefined, () => this.plugin.updateLogin());
     this.toggle("Hide on launch", "Hide after layout loads.", "hideOnLaunch", undefined, () => this.plugin.updateLogin());
@@ -401,16 +402,16 @@ class TraySettingsTab extends PluginSettingTab {
     });
     this.image();
     this.badge();
-    this.masterSwitch();
   }
 
   private masterSwitch(): void {
-    new Setting(this.containerEl)
+    const setting = new Setting(this.containerEl)
       .setName("Enable Run in Background")
       .setDesc("Master switch. Turn off all background, tray, launch-at-login, Dock/taskbar, close, and Quit behavior while keeping this settings page available.")
       .addToggle((control) => control
         .setValue(this.plugin.settings.pluginEnabled)
         .onChange((value) => void this.plugin.setPluginEnabled(value)));
+    setting.settingEl.addClass("run-in-background-master-switch");
   }
 
   private image(): void {
@@ -475,14 +476,14 @@ class TraySettingsTab extends PluginSettingTab {
   private badge(): void {
     const setting = new Setting(this.containerEl)
       .setName("Vault badge")
-      .setDesc("Up to two letters, numbers, emoji, or symbols, optionally separated by a space. Leave blank for no badge.");
+      .setDesc("Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.");
     this.badgePreview = setting.controlEl.createEl("img", {
       attr: { src: this.plugin.trayPreviewDataUrl, alt: "Tray icon with vault badge" },
     });
     this.stylePreview(this.badgePreview, 64);
     setting
       .addText((control) => {
-        control.setPlaceholder("G B").setValue(this.plugin.settings.vaultBadge).onChange((value) => {
+        control.setPlaceholder("G B C").setValue(this.plugin.settings.vaultBadge).onChange((value) => {
           const normalized = normalizeVaultBadge(value);
           control.setValue(normalized);
           this.plugin.settings.vaultBadge = normalized;
