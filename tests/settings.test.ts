@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defaultSettings, deriveVaultBadge, migrateSettings, normalizeBadgeColor, normalizeVaultBadge, reconcileRecoveryPath } from "../src/settings";
+import { defaultSettings, deriveVaultBadge, migrateSettings, normalizeBadgeColor, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch } from "../src/settings";
 
 describe("vault badges", () => {
   it.each([["Gabriel", "G"], ["Daily Notes", "DN"], ["GB-AI-Context", "GA"]])(
@@ -29,7 +29,7 @@ describe("settings migration", () => {
     expect(defaultSettings("Daily Notes")).toMatchObject({
       pluginEnabled: true,
       launchOnStartup: false,
-      hideOnLaunch: true,
+      hideOnLaunchMode: "login",
       runInBackground: true,
       keepRunningAfterQuit: true,
       createTrayIcon: true,
@@ -88,9 +88,17 @@ describe("settings migration", () => {
   it("preserves existing safe toggle preferences", () => {
     expect(migrateSettings({ pluginEnabled: false, hideOnLaunch: false, runInBackground: false }, "Gabriel")).toMatchObject({
       pluginEnabled: false,
-      hideOnLaunch: false,
+      hideOnLaunchMode: "never",
       runInBackground: false,
     });
+  });
+
+  it("migrates the old enabled hide-on-launch toggle to always", () => {
+    expect(migrateSettings({ hideOnLaunch: true }, "Gabriel").hideOnLaunchMode).toBe("always");
+  });
+
+  it("preserves the new hide-on-launch modes", () => {
+    expect(migrateSettings({ hideOnLaunchMode: "login" }, "Gabriel").hideOnLaunchMode).toBe("login");
   });
 
   it("keeps at least one recovery path visible", () => {
@@ -102,5 +110,21 @@ describe("settings migration", () => {
     settings.createTrayIcon = false;
     reconcileRecoveryPath(settings, "createTrayIcon");
     expect(settings.hideTaskbarIcon).toBe(false);
+  });
+});
+
+describe("hide on launch", () => {
+  it("always hides in always mode", () => {
+    expect(shouldHideOnLaunch("always", false)).toBe(true);
+    expect(shouldHideOnLaunch("always", true)).toBe(true);
+  });
+
+  it("hides in login mode only when opened at login", () => {
+    expect(shouldHideOnLaunch("login", true)).toBe(true);
+    expect(shouldHideOnLaunch("login", false)).toBe(false);
+  });
+
+  it("never hides in never mode", () => {
+    expect(shouldHideOnLaunch("never", true)).toBe(false);
   });
 });

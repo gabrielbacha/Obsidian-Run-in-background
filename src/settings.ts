@@ -6,7 +6,7 @@ const LEGACY_REDRAWN_OBSIDIAN_MARKER = "%3ClinearGradient%20id%3D%22o%22";
 export interface TraySettings {
   pluginEnabled: boolean;
   launchOnStartup: boolean;
-  hideOnLaunch: boolean;
+  hideOnLaunchMode: HideOnLaunchMode;
   runInBackground: boolean;
   keepRunningAfterQuit: boolean;
   hideTaskbarIcon: boolean;
@@ -14,6 +14,12 @@ export interface TraySettings {
   trayIconImage: string;
   vaultBadge: string;
   badgeBackgroundColor: string;
+}
+
+export type HideOnLaunchMode = "always" | "login" | "never";
+
+export function shouldHideOnLaunch(mode: HideOnLaunchMode, wasOpenedAtLogin: boolean): boolean {
+  return mode === "always" || (mode === "login" && wasOpenedAtLogin);
 }
 
 export function normalizeVaultBadge(value: string): string {
@@ -51,7 +57,7 @@ export function defaultSettings(vaultName: string): TraySettings {
   return {
     pluginEnabled: true,
     launchOnStartup: false,
-    hideOnLaunch: true,
+    hideOnLaunchMode: "login",
     runInBackground: true,
     keepRunningAfterQuit: true,
     hideTaskbarIcon: false,
@@ -81,7 +87,13 @@ export function migrateSettings(input: unknown, vaultName: string): TraySettings
   const settings: TraySettings = {
     pluginEnabled: boolean("pluginEnabled"),
     launchOnStartup: boolean("launchOnStartup"),
-    hideOnLaunch: boolean("hideOnLaunch"),
+    hideOnLaunchMode: source.hideOnLaunchMode === "always"
+      || source.hideOnLaunchMode === "login"
+      || source.hideOnLaunchMode === "never"
+      ? source.hideOnLaunchMode
+      : typeof source.hideOnLaunch === "boolean"
+        ? source.hideOnLaunch ? "always" : "never"
+        : defaults.hideOnLaunchMode,
     runInBackground: boolean("runInBackground"),
     keepRunningAfterQuit: boolean("keepRunningAfterQuit"),
     hideTaskbarIcon: boolean("hideTaskbarIcon"),

@@ -1,7 +1,7 @@
 import { normalizePath, Plugin, PluginSettingTab, Setting, type App as ObsidianApp } from "obsidian";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
 import { QuitLifecycle, type ExitIntent } from "./lifecycle";
-import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, type TraySettings } from "./settings";
+import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 
 type BrowserWindow = any;
 type ElectronEvent = { preventDefault(): void };
@@ -117,7 +117,8 @@ export default class RunInBackgroundPlugin extends Plugin {
     await this.createTray();
     this.updateLogin();
     this.updateTaskbar();
-    if (applyHideOnLaunch && this.settings.hideOnLaunch) {
+    const wasOpenedAtLogin = Boolean(remote.app.getLoginItemSettings().wasOpenedAtLogin);
+    if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, wasOpenedAtLogin)) {
       this.app.workspace.onLayoutReady(() => {
         if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows();
       });
@@ -247,7 +248,9 @@ export default class RunInBackgroundPlugin extends Plugin {
   updateLogin(): void {
     remote.app.setLoginItemSettings({
       openAtLogin: this.runtimeActive && this.settings.launchOnStartup,
-      openAsHidden: this.runtimeActive && this.settings.runInBackground && this.settings.hideOnLaunch,
+      openAsHidden: this.runtimeActive
+        && this.settings.runInBackground
+        && this.settings.hideOnLaunchMode !== "never",
     });
   }
 
@@ -379,7 +382,19 @@ class TraySettingsTab extends PluginSettingTab {
     this.masterSwitch();
     new Setting(this.containerEl).setName("Window management").setHeading();
     this.toggle("Launch on startup", "Open Obsidian when you log in.", "launchOnStartup", undefined, () => this.plugin.updateLogin());
-    this.toggle("Hide on launch", "Hide after layout loads.", "hideOnLaunch", undefined, () => this.plugin.updateLogin());
+    new Setting(this.containerEl)
+      .setName("Hide on launch")
+      .setDesc("Choose whether the vault starts hidden. Login detection distinguishes an automatic device-login launch from opening Obsidian normally.")
+      .addDropdown((control) => control
+        .addOption("always", "Always")
+        .addOption("login", "Only when opened at login")
+        .addOption("never", "Never")
+        .setValue(this.plugin.settings.hideOnLaunchMode)
+        .onChange((value) => {
+          if (value !== "always" && value !== "login" && value !== "never") return;
+          this.plugin.settings.hideOnLaunchMode = value;
+          void this.commit(() => this.plugin.updateLogin());
+        }));
     this.toggle("Run in background", "Hide an ordinary window close instead of closing the vault.", "runInBackground", undefined, () => {
       this.plugin.updateLogin();
       this.plugin.showWindows();

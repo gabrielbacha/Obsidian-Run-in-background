@@ -47,7 +47,7 @@ Quit command can be configured independently.
 | --- | --- | --- |
 | Enable Run in Background | Master switch for all plugin runtime behavior | On |
 | Launch on startup | Launch Obsidian when you sign in | Off |
-| Hide on launch | Start the vault hidden | On |
+| Hide on launch | Always, only when opened at device login, or never start hidden | Only when opened at login |
 | Run in background | Hide an ordinary window close | On |
 | Keep running after Quit command | Turn Cmd+Q / Quit into hide | On |
 | Hide Dock/taskbar icon | Remove Obsidian from the Dock or taskbar | Off |
