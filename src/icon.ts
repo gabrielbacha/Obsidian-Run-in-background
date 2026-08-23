@@ -70,11 +70,12 @@ function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgro
     context.roundRect(x, y, badgeWidth, badgeHeight, 2 * scale);
     context.fill();
     context.fillStyle = badgeTextColor(badgeBackgroundColor);
-    context.font = `700 ${visibleCharacters === 1 ? 6.5 : visibleCharacters === 2 ? 5.5 : 4}px system-ui, sans-serif`;
+    context.font = `700 ${visibleCharacters === 1 ? 6.5 : visibleCharacters === 2 ? 5.5 : 5.25}px system-ui, sans-serif`;
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.scale(scale, scale);
-    context.fillText(badge, (x + badgeWidth / 2) / scale, (y + badgeHeight / 2 + 0.3 * scale) / scale);
+    const maxTextWidth = badgeWidth / scale - (visibleCharacters === 3 ? 0.5 : 2);
+    context.fillText(badge, (x + badgeWidth / 2) / scale, (y + badgeHeight / 2 + 0.3 * scale) / scale, maxTextWidth);
   }
   return canvas.toDataURL("image/png");
 }
