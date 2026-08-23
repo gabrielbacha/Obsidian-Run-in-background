@@ -4,7 +4,7 @@
   "author": "Gabriel Bacha",
   "authorUrl": "https://github.com/gabrielbacha",
   "description": "Keep vaults running in the background for quick access and continued Sync.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "isDesktopOnly": true,
   "minAppVersion": "1.0.0"
 }
