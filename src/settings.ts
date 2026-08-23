@@ -4,6 +4,7 @@ const LEGACY_OBSIDIAN_ICON_PREFIX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEU
 const LEGACY_REDRAWN_OBSIDIAN_MARKER = "%3ClinearGradient%20id%3D%22o%22";
 
 export interface TraySettings {
+  pluginEnabled: boolean;
   launchOnStartup: boolean;
   hideOnLaunch: boolean;
   runInBackground: boolean;
@@ -48,6 +49,7 @@ export function deriveVaultBadge(vaultName: string): string {
 
 export function defaultSettings(vaultName: string): TraySettings {
   return {
+    pluginEnabled: true,
     launchOnStartup: false,
     hideOnLaunch: true,
     runInBackground: true,
@@ -77,6 +79,7 @@ export function migrateSettings(input: unknown, vaultName: string): TraySettings
     typeof source[key] === "string" ? source[key] : defaults[key] as string;
   const storedTrayIcon = string("trayIconImage");
   const settings: TraySettings = {
+    pluginEnabled: boolean("pluginEnabled"),
     launchOnStartup: boolean("launchOnStartup"),
     hideOnLaunch: boolean("hideOnLaunch"),
     runInBackground: boolean("runInBackground"),

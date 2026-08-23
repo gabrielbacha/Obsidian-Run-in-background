@@ -54,9 +54,15 @@ Quit command can be configured independently.
 | Tray icon image | Select a preset or upload a square PNG/SVG | Obsidian |
 | Vault badge | Add up to two characters, optionally separated by a space | Vault initials |
 | Badge color | Set a vault-specific badge background with automatic contrast | Dark |
+| Enable Run in Background | Master switch for all plugin runtime behavior | On |
 
 For safety, hiding the Dock/taskbar icon keeps the tray icon enabled. Disabling
 the tray icon restores the Dock/taskbar icon.
+
+The final **Enable Run in Background** switch deactivates the entire runtime
+without disabling the community plugin. While it is off, no close or Quit
+behavior, tray icon, Dock/taskbar changes, or launch-at-login behavior remains
+active; the settings page stays available so you can turn it back on.
 
 ## Installation
 

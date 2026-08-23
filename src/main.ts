@@ -28,8 +28,11 @@ export default class RunInBackgroundPlugin extends Plugin {
   private listeners = new Map<BrowserWindow, Listeners>();
   private tray?: Tray;
   private settingsTab?: TraySettingsTab;
+  private rootWindow?: BrowserWindow;
   private cleaned = false;
   private closeInterceptorsReleased = false;
+  private runtimeActive = false;
+  private commandsRegistered = false;
   private lastSecondInstanceAt = 0;
 
   private beforeUnload = (event: BeforeUnloadEvent): void => {
@@ -87,9 +90,22 @@ export default class RunInBackgroundPlugin extends Plugin {
     await this.loadSettings();
     this.settingsTab = new TraySettingsTab(this.app, this);
     this.addSettingTab(this.settingsTab);
+    if (this.settings.pluginEnabled) await this.activateRuntime(true);
+    else {
+      this.updateLogin();
+      this.updateTaskbar();
+      await this.createTray();
+    }
+  }
+
+  private async activateRuntime(applyHideOnLaunch: boolean): Promise<void> {
+    if (this.runtimeActive) return;
+    this.runtimeActive = true;
+    this.lifecycle = new QuitLifecycle();
     this.cleaned = false;
     this.closeInterceptorsReleased = false;
     const current = remote.getCurrentWindow();
+    this.rootWindow = current;
     this.track(current);
     current.webContents.on("did-create-window", this.windowCreated);
     window.addEventListener("beforeunload", this.beforeUnload);
@@ -101,9 +117,38 @@ export default class RunInBackgroundPlugin extends Plugin {
     await this.createTray();
     this.updateLogin();
     this.updateTaskbar();
-    if (this.settings.hideOnLaunch) this.app.workspace.onLayoutReady(() => this.hideWindows());
+    if (applyHideOnLaunch && this.settings.hideOnLaunch) {
+      this.app.workspace.onLayoutReady(() => {
+        if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows();
+      });
+    }
+    this.registerRuntimeCommands();
+  }
+
+  private registerRuntimeCommands(): void {
+    if (this.commandsRegistered) return;
     this.addCommand({ id: "relaunch-app", name: "Relaunch Obsidian", callback: () => this.relaunch() });
     this.addCommand({ id: "close-vault", name: "Close Vault", callback: () => this.closeVault() });
+    this.commandsRegistered = true;
+  }
+
+  private unregisterRuntimeCommands(): void {
+    if (!this.commandsRegistered) return;
+    this.removeCommand("relaunch-app");
+    this.removeCommand("close-vault");
+    this.commandsRegistered = false;
+  }
+
+  async setPluginEnabled(enabled: boolean): Promise<void> {
+    if (this.settings.pluginEnabled === enabled && this.runtimeActive === enabled) return;
+    this.settings.pluginEnabled = enabled;
+    await this.saveSettings();
+    if (enabled) await this.activateRuntime(false);
+    else {
+      this.beginExit("plugin-unload");
+      this.cleanup();
+      this.updateLogin();
+    }
   }
 
   override onunload(): void {
@@ -201,12 +246,16 @@ export default class RunInBackgroundPlugin extends Plugin {
 
   updateLogin(): void {
     remote.app.setLoginItemSettings({
-      openAtLogin: this.settings.launchOnStartup,
-      openAsHidden: this.settings.runInBackground && this.settings.hideOnLaunch,
+      openAtLogin: this.runtimeActive && this.settings.launchOnStartup,
+      openAsHidden: this.runtimeActive && this.settings.runInBackground && this.settings.hideOnLaunch,
     });
   }
 
   updateTaskbar(): void {
+    if (!this.runtimeActive) {
+      if (process.platform === "darwin") remote.app.dock?.show();
+      return;
+    }
     for (const trackedWindow of this.windows) trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
     if (process.platform !== "darwin") return;
     if (this.settings.hideTaskbarIcon) remote.app.dock?.hide();
@@ -227,7 +276,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     );
     this.trayPreviewDataUrl = composed.previewDataUrl;
     this.settingsTab?.updatePreview(composed.previewDataUrl);
-    if (!this.settings.createTrayIcon) return;
+    if (!this.runtimeActive || !this.settings.createTrayIcon) return;
     const nativeIcon = remote.nativeImage.createEmpty();
     for (const representation of composed.representations) nativeIcon.addRepresentation(representation);
     const vault = this.app.vault.getName();
@@ -272,8 +321,13 @@ export default class RunInBackgroundPlugin extends Plugin {
   private cleanup(): void {
     if (this.cleaned) return;
     this.cleaned = true;
+    this.runtimeActive = false;
+    this.unregisterRuntimeCommands();
     this.releaseCloseInterceptors();
-    this.safely(() => remote.getCurrentWindow().webContents.removeListener("did-create-window", this.windowCreated));
+    if (this.rootWindow) {
+      this.safely(() => this.rootWindow?.webContents.removeListener("did-create-window", this.windowCreated));
+      this.rootWindow = undefined;
+    }
     this.safely(() => remote.app.removeListener("before-quit", this.beforeQuit));
     this.safely(() => remote.app.removeListener("activate", this.appActivated));
     this.safely(() => remote.app.removeListener("second-instance", this.secondInstance));
@@ -347,6 +401,16 @@ class TraySettingsTab extends PluginSettingTab {
     });
     this.image();
     this.badge();
+    this.masterSwitch();
+  }
+
+  private masterSwitch(): void {
+    new Setting(this.containerEl)
+      .setName("Enable Run in Background")
+      .setDesc("Master switch. Turn off all background, tray, launch-at-login, Dock/taskbar, close, and Quit behavior while keeping this settings page available.")
+      .addToggle((control) => control
+        .setValue(this.plugin.settings.pluginEnabled)
+        .onChange((value) => void this.plugin.setPluginEnabled(value)));
   }
 
   private image(): void {

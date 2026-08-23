@@ -27,6 +27,7 @@ describe("vault badges", () => {
 describe("settings migration", () => {
   it("uses background-first defaults for fresh installs", () => {
     expect(defaultSettings("Daily Notes")).toMatchObject({
+      pluginEnabled: true,
       launchOnStartup: false,
       hideOnLaunch: true,
       runInBackground: true,
@@ -85,7 +86,8 @@ describe("settings migration", () => {
   });
 
   it("preserves existing safe toggle preferences", () => {
-    expect(migrateSettings({ hideOnLaunch: false, runInBackground: false }, "Gabriel")).toMatchObject({
+    expect(migrateSettings({ pluginEnabled: false, hideOnLaunch: false, runInBackground: false }, "Gabriel")).toMatchObject({
+      pluginEnabled: false,
       hideOnLaunch: false,
       runInBackground: false,
     });
