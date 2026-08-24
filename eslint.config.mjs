@@ -7,7 +7,11 @@ export default tseslint.config(
   { ignores: ["main.js", "node_modules"] },
   {
     files: ["src/**/*.ts", "tests/**/*.ts"],
-    languageOptions: { globals: { window: "readonly", process: "readonly", FileReader: "readonly" } },
-    rules: { "@typescript-eslint/no-explicit-any": "off" }
-  }
+    languageOptions: {
+      globals: { window: "readonly", process: "readonly", FileReader: "readonly" },
+    },
+    rules: {
+      "@typescript-eslint/no-explicit-any": "error",
+    },
+  },
 );

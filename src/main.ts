@@ -1,23 +1,16 @@
-import { normalizePath, Plugin, PluginSettingTab, Setting, type App as ObsidianApp } from "obsidian";
+import { normalizePath, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
+import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
 import { QuitLifecycle, type ExitIntent } from "./lifecycle";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
+import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
 
-type BrowserWindow = any;
-type ElectronEvent = { preventDefault(): void };
-type MenuItemConstructorOptions = any;
-type Tray = any;
-type Listeners = {
-  close: (event: ElectronEvent) => void;
-  closed: () => void;
-  maximize: () => void;
-  unmaximize: () => void;
-  focus?: () => void;
-  sessionEnd?: () => void;
-};
+interface WindowWithElectron extends Window {
+  require(module: "electron"): ElectronExports;
+}
 
-const electron = window.require("electron") as any;
-const remote = electron.remote;
+const electron = (window as unknown as WindowWithElectron).require("electron");
+const remote: ElectronRemote = electron.remote;
 
 export default class RunInBackgroundPlugin extends Plugin {
   override settings: TraySettings = defaultSettings("");
@@ -25,7 +18,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private lifecycle = new QuitLifecycle();
   private windows = new Set<BrowserWindow>();
   private maximized = new Set<BrowserWindow>();
-  private listeners = new Map<BrowserWindow, Listeners>();
+  private listeners = new Map<BrowserWindow, WindowListeners>();
   private tray?: Tray;
   private settingsTab?: TraySettingsTab;
   private rootWindow?: BrowserWindow;
@@ -38,7 +31,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private beforeUnload = (event: BeforeUnloadEvent): void => {
     if (!this.lifecycle.shouldInterceptClose(this.settings.runInBackground)) return;
     event.preventDefault();
-    (event as unknown as { returnValue: boolean }).returnValue = false;
+    event.returnValue = "";
     remote.getCurrentWindow().hide();
   };
 
@@ -68,23 +61,23 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.lastSecondInstanceAt = Date.now();
     this.appActivated();
   };
-  private browserWindowCreated = (_event: unknown, window: BrowserWindow): void => {
+  private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {
     if (!this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, Date.now())) return;
-    if (this.windows.has(window)) return;
+    if (this.windows.has(createdWindow)) return;
     const hidePicker = (): void => {
-      if (window.isDestroyed()) return;
-      window.hide();
-      window.setSkipTaskbar(true);
+      if (createdWindow.isDestroyed()) return;
+      createdWindow.hide();
+      createdWindow.setSkipTaskbar(true);
     };
-    window.on("ready-to-show", hidePicker);
-    window.on("show", hidePicker);
+    createdWindow.on("ready-to-show", hidePicker);
+    createdWindow.on("show", hidePicker);
     window.setTimeout(hidePicker, 0);
     window.setTimeout(() => {
       hidePicker();
       this.appActivated();
     }, 150);
   };
-  private windowCreated = (_event: unknown, window: BrowserWindow): void => this.track(window);
+  private windowCreated = (createdWindow: BrowserWindow): void => this.track(createdWindow);
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -184,7 +177,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.windows.add(trackedWindow);
     if (trackedWindow.isMaximized()) this.maximized.add(trackedWindow);
     trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
-    const listeners: Listeners = {
+    const listeners: WindowListeners = {
       close: (event) => {
         if (!this.lifecycle.shouldInterceptClose(this.settings.runInBackground)) return;
         event.preventDefault();
@@ -199,7 +192,9 @@ export default class RunInBackgroundPlugin extends Plugin {
         if (this.settings.hideTaskbarIcon) remote.app.dock?.hide();
       };
     }
-    if (process.platform === "win32") listeners.sessionEnd = this.systemShutdown;
+    if (process.platform === "win32") {
+      listeners.sessionEnd = () => this.systemShutdown();
+    }
     trackedWindow.on("close", listeners.close);
     trackedWindow.on("closed", listeners.closed);
     trackedWindow.on("maximize", listeners.maximize);
@@ -216,8 +211,14 @@ export default class RunInBackgroundPlugin extends Plugin {
       this.safely(() => trackedWindow.removeListener("closed", listeners.closed));
       this.safely(() => trackedWindow.removeListener("maximize", listeners.maximize));
       this.safely(() => trackedWindow.removeListener("unmaximize", listeners.unmaximize));
-      if (listeners.focus) this.safely(() => trackedWindow.removeListener("focus", listeners.focus));
-      if (listeners.sessionEnd) this.safely(() => trackedWindow.removeListener("session-end", listeners.sessionEnd));
+      if (listeners.focus) {
+        const focusListener = listeners.focus;
+        this.safely(() => trackedWindow.removeListener("focus", focusListener));
+      }
+      if (listeners.sessionEnd) {
+        const sessionEndListener = listeners.sessionEnd;
+        this.safely(() => trackedWindow.removeListener("session-end", sessionEndListener));
+      }
     }
     this.listeners.delete(trackedWindow);
     this.windows.delete(trackedWindow);
@@ -301,9 +302,9 @@ export default class RunInBackgroundPlugin extends Plugin {
 
   private openSettings(): void {
     this.showWindows();
-    const settings = (this.app as unknown as { setting: { open(): void; openTabById(id: string): unknown } }).setting;
-    settings.open();
-    settings.openTabById(this.manifest.id);
+    const settingsModal = (this.app as unknown as AppWithSettingModal).setting;
+    settingsModal.open();
+    settingsModal.openTabById(this.manifest.id);
   }
 
   private relaunch(): void {
@@ -377,6 +378,151 @@ class TraySettingsTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  override getSettingDefinitions(): SettingDefinitionItem[] {
+    const isMac = process.platform === "darwin";
+    return [
+      {
+        name: "Enable Run in Background",
+        desc: "Master switch. Turn off all background, tray, launch-at-login, Dock/taskbar, close, and Quit behavior while keeping this settings page available.",
+        control: {
+          type: "toggle",
+          key: "pluginEnabled",
+        },
+      },
+      {
+        type: "group",
+        heading: "Window management",
+        items: [
+          {
+            name: "Launch on startup",
+            desc: "Open Obsidian when you log in.",
+            control: {
+              type: "toggle",
+              key: "launchOnStartup",
+            },
+          },
+          {
+            name: "Hide on launch",
+            desc: "Choose whether the vault starts hidden. Login detection distinguishes an automatic device-login launch from opening Obsidian normally.",
+            control: {
+              type: "dropdown",
+              key: "hideOnLaunchMode",
+              options: {
+                always: "Always",
+                login: "Only when opened at login",
+                never: "Never",
+              },
+            },
+          },
+          {
+            name: "Run in background",
+            desc: "Hide an ordinary window close instead of closing the vault.",
+            control: {
+              type: "toggle",
+              key: "runInBackground",
+            },
+          },
+          {
+            name: "Keep running after Quit command",
+            desc: "Make Cmd+Q or the normal Quit command hide this vault. System shutdown still exits.",
+            control: {
+              type: "toggle",
+              key: "keepRunningAfterQuit",
+            },
+          },
+          {
+            name: isMac ? "Hide Dock icon" : "Hide taskbar icon",
+            desc: "Hide Obsidian from the Dock or taskbar. A tray icon will remain available.",
+            control: {
+              type: "toggle",
+              key: "hideTaskbarIcon",
+            },
+          },
+          {
+            name: "Create tray icon",
+            desc: "Create a tray or menu-bar icon.",
+            control: {
+              type: "toggle",
+              key: "createTrayIcon",
+            },
+          },
+          {
+            name: "Tray icon image",
+            desc: "Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.",
+            render: (setting: Setting) => {
+              this.renderTrayImageControl(setting);
+            },
+          },
+          {
+            name: "Vault badge",
+            desc: "Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.",
+            render: (setting: Setting) => {
+              this.renderVaultBadgeControl(setting);
+            },
+          },
+        ],
+      },
+    ];
+  }
+
+  override getControlValue(key: string): unknown {
+    if (key in this.plugin.settings) {
+      return this.plugin.settings[key as keyof TraySettings];
+    }
+    return undefined;
+  }
+
+  override async setControlValue(key: string, value: unknown): Promise<void> {
+    if (key === "pluginEnabled") {
+      await this.plugin.setPluginEnabled(Boolean(value));
+      return;
+    }
+    if (key === "launchOnStartup") {
+      this.plugin.settings.launchOnStartup = Boolean(value);
+      await this.plugin.saveSettings();
+      this.plugin.updateLogin();
+      return;
+    }
+    if (key === "hideOnLaunchMode") {
+      if (value === "always" || value === "login" || value === "never") {
+        this.plugin.settings.hideOnLaunchMode = value;
+        await this.plugin.saveSettings();
+        this.plugin.updateLogin();
+      }
+      return;
+    }
+    if (key === "runInBackground") {
+      this.plugin.settings.runInBackground = Boolean(value);
+      await this.plugin.saveSettings();
+      this.plugin.updateLogin();
+      this.plugin.showWindows();
+      return;
+    }
+    if (key === "keepRunningAfterQuit") {
+      this.plugin.settings.keepRunningAfterQuit = Boolean(value);
+      await this.plugin.saveSettings();
+      return;
+    }
+    if (key === "hideTaskbarIcon") {
+      const val = Boolean(value);
+      this.plugin.settings.hideTaskbarIcon = val;
+      if (val) reconcileRecoveryPath(this.plugin.settings, "hideTaskbarIcon");
+      await this.plugin.saveSettings();
+      this.plugin.updateTaskbar();
+      await this.plugin.createTray();
+      return;
+    }
+    if (key === "createTrayIcon") {
+      const val = Boolean(value);
+      this.plugin.settings.createTrayIcon = val;
+      if (!val) reconcileRecoveryPath(this.plugin.settings, "createTrayIcon");
+      await this.plugin.saveSettings();
+      this.plugin.updateTaskbar();
+      await this.plugin.createTray();
+      return;
+    }
+  }
+
   override display(): void {
     this.containerEl.empty();
     this.masterSwitch();
@@ -415,8 +561,15 @@ class TraySettingsTab extends PluginSettingTab {
       await this.plugin.createTray();
       this.display();
     });
-    this.image();
-    this.badge();
+    const imageSetting = new Setting(this.containerEl)
+      .setName("Tray icon image")
+      .setDesc("Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.");
+    this.renderTrayImageControl(imageSetting);
+
+    const badgeSetting = new Setting(this.containerEl)
+      .setName("Vault badge")
+      .setDesc("Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.");
+    this.renderVaultBadgeControl(badgeSetting);
   }
 
   private masterSwitch(): void {
@@ -429,10 +582,8 @@ class TraySettingsTab extends PluginSettingTab {
     setting.settingEl.addClass("run-in-background-master-switch");
   }
 
-  private image(): void {
-    const setting = new Setting(this.containerEl)
-      .setName("Tray icon image")
-      .setDesc("Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.");
+  private renderTrayImageControl(setting: Setting): void {
+    setting.controlEl.empty();
     setting.controlEl.setCssStyles({ gap: "8px" });
     const presetButtons: HTMLButtonElement[] = [];
     const selectedPreset = (): string | undefined =>
@@ -488,10 +639,8 @@ class TraySettingsTab extends PluginSettingTab {
     refreshSelection();
   }
 
-  private badge(): void {
-    const setting = new Setting(this.containerEl)
-      .setName("Vault badge")
-      .setDesc("Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.");
+  private renderVaultBadgeControl(setting: Setting): void {
+    setting.controlEl.empty();
     this.badgePreview = setting.controlEl.createEl("img", {
       attr: { src: this.plugin.trayPreviewDataUrl, alt: "Tray icon with vault badge" },
     });
