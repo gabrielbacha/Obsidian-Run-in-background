@@ -257,13 +257,13 @@ export default class RunInBackgroundPlugin extends Plugin {
 
   updateTaskbar(): void {
     if (!this.runtimeActive) {
-      if (process.platform === "darwin") remote.app.dock?.show();
+      if (process.platform === "darwin") void remote.app.dock?.show();
       return;
     }
     for (const trackedWindow of this.windows) trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
     if (process.platform !== "darwin") return;
     if (this.settings.hideTaskbarIcon) remote.app.dock?.hide();
-    else remote.app.dock?.show();
+    else void remote.app.dock?.show();
   }
 
   async createTray(): Promise<void> {
@@ -343,7 +343,7 @@ export default class RunInBackgroundPlugin extends Plugin {
       });
       this.untrack(trackedWindow);
     }
-    if (process.platform === "darwin") this.safely(() => remote.app.dock?.show());
+    if (process.platform === "darwin") this.safely(() => { void remote.app.dock?.show(); });
     this.safely(() => this.tray?.destroy());
     this.tray = undefined;
   }
