@@ -25,7 +25,8 @@ Obsidian Sync and cannot sync while the computer is asleep or offline.
 - Open the plugin settings directly from the tray menu.
 - Import compatible settings from the original Tray plugin on first launch.
 
-Run in Background is desktop-only and makes no network requests.
+Run in Background requires Obsidian 1.7.2 or newer, is desktop-only, and makes
+no network requests.
 
 ## Window and quit behavior
 
