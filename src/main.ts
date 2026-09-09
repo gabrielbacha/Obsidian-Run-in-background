@@ -1,7 +1,8 @@
-import { normalizePath, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
-import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray } from "electron";
+import { FileSystemAdapter, normalizePath, Notice, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
+import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
-import { QuitLifecycle, type ExitIntent } from "./lifecycle";
+import { backgroundThrottlingFor, isOtherVaultWindow, QuitLifecycle, type ExitIntent } from "./lifecycle";
+import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
 
@@ -19,6 +20,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private windows = new Set<BrowserWindow>();
   private maximized = new Set<BrowserWindow>();
   private listeners = new Map<BrowserWindow, WindowListeners>();
+  private backgroundThrottling = new Map<WebContents, boolean>();
   private tray?: Tray;
   private settingsTab?: TraySettingsTab;
   private rootWindow?: BrowserWindow;
@@ -27,6 +29,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private runtimeActive = false;
   private commandsRegistered = false;
   private lastSecondInstanceAt = 0;
+  private linuxAutostart?: LinuxAutostartManager;
 
   private beforeUnload = (event: BeforeUnloadEvent): void => {
     if (!this.lifecycle.shouldInterceptClose(this.settings.runInBackground)) return;
@@ -57,8 +60,15 @@ export default class RunInBackgroundPlugin extends Plugin {
   private appActivated = (): void => {
     if (this.lifecycle.shouldRestoreOnActivation()) this.showWindows();
   };
-  private secondInstance = (): void => {
+  private secondInstance = (_event: ElectronEvent, commandLine: string[]): void => {
     this.lastSecondInstanceAt = Date.now();
+    if (process.platform === "linux"
+      && isLinuxLoginLaunch(commandLine)
+      && this.settings.launchOnStartup
+      && shouldHideOnLaunch(this.settings.hideOnLaunchMode, true)) {
+      this.hideWindows(true);
+      return;
+    }
     this.appActivated();
   };
   private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {
@@ -85,7 +95,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.addSettingTab(this.settingsTab);
     if (this.settings.pluginEnabled) await this.activateRuntime(true);
     else {
-      this.updateLogin();
+      await this.updateLogin();
       this.updateTaskbar();
       await this.createTray();
     }
@@ -108,9 +118,11 @@ export default class RunInBackgroundPlugin extends Plugin {
     remote.app.on("browser-window-created", this.browserWindowCreated);
     remote.powerMonitor?.on("shutdown", this.systemShutdown);
     await this.createTray();
-    this.updateLogin();
+    await this.updateLogin();
     this.updateTaskbar();
-    const wasOpenedAtLogin = Boolean(remote.app.getLoginItemSettings().wasOpenedAtLogin);
+    const wasOpenedAtLogin = process.platform === "linux"
+      ? isLinuxLoginLaunch(process.argv)
+      : Boolean(remote.app.getLoginItemSettings().wasOpenedAtLogin);
     if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, wasOpenedAtLogin)) {
       this.app.workspace.onLayoutReady(() => {
         if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows();
@@ -141,13 +153,15 @@ export default class RunInBackgroundPlugin extends Plugin {
     else {
       this.beginExit("plugin-unload");
       this.cleanup();
-      this.updateLogin();
+      await this.updateLogin();
     }
   }
 
   override onunload(): void {
+    const disabledWhileRunning = this.lifecycle.intent === "none" && !this.cleaned;
     this.beginExit("plugin-unload");
     this.cleanup();
+    if (disabledWhileRunning) void this.updateLogin();
   }
 
   private safely(action: () => void): void {
@@ -175,6 +189,10 @@ export default class RunInBackgroundPlugin extends Plugin {
   private track(trackedWindow: BrowserWindow): void {
     if (this.windows.has(trackedWindow)) return;
     this.windows.add(trackedWindow);
+    const contents = trackedWindow.webContents;
+    const originalThrottling = this.backgroundThrottling.get(contents) ?? contents.getBackgroundThrottling();
+    this.backgroundThrottling.set(contents, originalThrottling);
+    contents.setBackgroundThrottling(backgroundThrottlingFor(this.settings.runInBackground, originalThrottling));
     if (trackedWindow.isMaximized()) this.maximized.add(trackedWindow);
     trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
     const listeners: WindowListeners = {
@@ -246,13 +264,42 @@ export default class RunInBackgroundPlugin extends Plugin {
     else this.showWindows();
   }
 
-  updateLogin(): void {
+  updateBackgroundMode(): void {
+    for (const [contents, originalThrottling] of this.backgroundThrottling) {
+      if (!contents.isDestroyed()) {
+        contents.setBackgroundThrottling(backgroundThrottlingFor(this.settings.runInBackground, originalThrottling));
+      }
+    }
+  }
+
+  async updateLogin(): Promise<void> {
+    const enabled = this.runtimeActive && this.settings.launchOnStartup;
+    if (process.platform === "linux") {
+      try {
+        this.linuxAutostart ??= new LinuxAutostartManager(this.vaultPath());
+        await this.linuxAutostart.setEnabled(enabled);
+      } catch (error) {
+        console.error("Run in Background: unable to update Linux autostart", error);
+        if (enabled) {
+          this.settings.launchOnStartup = false;
+          await this.saveSettings();
+          new Notice("Run in Background could not enable launch on startup. Check the console for details.");
+        }
+      }
+      return;
+    }
     remote.app.setLoginItemSettings({
-      openAtLogin: this.runtimeActive && this.settings.launchOnStartup,
+      openAtLogin: enabled,
       openAsHidden: this.runtimeActive
         && this.settings.runInBackground
         && this.settings.hideOnLaunchMode !== "never",
     });
+  }
+
+  private vaultPath(): string {
+    return this.app.vault.adapter instanceof FileSystemAdapter
+      ? this.app.vault.adapter.getBasePath()
+      : this.app.vault.getName();
   }
 
   updateTaskbar(): void {
@@ -317,9 +364,20 @@ export default class RunInBackgroundPlugin extends Plugin {
   private closeVault(): void {
     this.beginExit("explicit-quit");
     const vaultWindows = [...this.windows];
+    const owned = new Set(vaultWindows);
+    const appName = remote.app.getName();
+    const hasOtherVault = remote.BrowserWindow.getAllWindows().some((candidate) => isOtherVaultWindow({
+      owned: owned.has(candidate),
+      destroyed: candidate.isDestroyed(),
+      title: candidate.getTitle(),
+      appName,
+      url: candidate.webContents.getURL(),
+    }));
     this.cleanup();
-    if (remote.BrowserWindow.getAllWindows().length === vaultWindows.length) remote.app.quit();
-    else for (const trackedWindow of vaultWindows) trackedWindow.destroy();
+    for (const trackedWindow of vaultWindows) {
+      if (!trackedWindow.isDestroyed()) trackedWindow.close();
+    }
+    if (!hasOtherVault) remote.app.quit();
   }
 
   private cleanup(): void {
@@ -343,6 +401,12 @@ export default class RunInBackgroundPlugin extends Plugin {
       });
       this.untrack(trackedWindow);
     }
+    for (const [contents, originalThrottling] of this.backgroundThrottling) {
+      this.safely(() => {
+        if (!contents.isDestroyed()) contents.setBackgroundThrottling(originalThrottling);
+      });
+    }
+    this.backgroundThrottling.clear();
     if (process.platform === "darwin") this.safely(() => { void remote.app.dock?.show(); });
     this.safely(() => this.tray?.destroy());
     this.tray = undefined;
@@ -480,21 +544,22 @@ class TraySettingsTab extends PluginSettingTab {
     if (key === "launchOnStartup") {
       this.plugin.settings.launchOnStartup = Boolean(value);
       await this.plugin.saveSettings();
-      this.plugin.updateLogin();
+      await this.plugin.updateLogin();
       return;
     }
     if (key === "hideOnLaunchMode") {
       if (value === "always" || value === "login" || value === "never") {
         this.plugin.settings.hideOnLaunchMode = value;
         await this.plugin.saveSettings();
-        this.plugin.updateLogin();
+        await this.plugin.updateLogin();
       }
       return;
     }
     if (key === "runInBackground") {
       this.plugin.settings.runInBackground = Boolean(value);
       await this.plugin.saveSettings();
-      this.plugin.updateLogin();
+      this.plugin.updateBackgroundMode();
+      await this.plugin.updateLogin();
       this.plugin.showWindows();
       return;
     }
@@ -542,8 +607,9 @@ class TraySettingsTab extends PluginSettingTab {
           void this.commit(() => this.plugin.updateLogin());
         }));
     this.toggle("Run in background", "Hide an ordinary window close instead of closing the vault.", "runInBackground", undefined, () => {
-      this.plugin.updateLogin();
+      this.plugin.updateBackgroundMode();
       this.plugin.showWindows();
+      return this.plugin.updateLogin();
     });
     this.toggle("Keep running after Quit command", "Make Cmd+Q or the normal Quit command hide this vault. System shutdown still exits.", "keepRunningAfterQuit");
     const taskbarName = process.platform === "darwin" ? "Hide Dock icon" : "Hide taskbar icon";

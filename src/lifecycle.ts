@@ -8,6 +8,23 @@ export type ExitIntent =
 
 export type UserQuitDecision = "hide" | "exit";
 
+export interface WindowIdentity {
+  owned: boolean;
+  destroyed: boolean;
+  title: string;
+  appName: string;
+  url: string;
+}
+
+export function isOtherVaultWindow(window: WindowIdentity): boolean {
+  if (window.owned || window.destroyed) return false;
+  return window.url.startsWith("app://obsidian.md") && window.title.trim() !== "" && window.title !== window.appName;
+}
+
+export function backgroundThrottlingFor(runInBackground: boolean, originalValue: boolean): boolean {
+  return runInBackground ? false : originalValue;
+}
+
 export class QuitLifecycle {
   private currentIntent: ExitIntent = "none";
 

@@ -25,8 +25,9 @@ Obsidian Sync and cannot sync while the computer is asleep or offline.
 - Open the plugin settings directly from the tray menu.
 - Import compatible settings from the original Tray plugin on first launch.
 
-Run in Background requires Obsidian 1.7.2 or newer, is desktop-only, and makes
-no network requests.
+Run in Background requires Obsidian 1.7.2 or newer and is desktop-only. It
+makes no internet requests. On sandboxed Linux packages it communicates with
+the local desktop portal to request background and login-startup permission.
 
 ## Window and quit behavior
 
@@ -64,6 +65,15 @@ The top **Enable Run in Background** switch deactivates the entire runtime
 without disabling the community plugin. While it is off, no close or Quit
 behavior, tray icon, Dock/taskbar changes, or launch-at-login behavior remains
 active; the settings page stays available so you can turn it back on.
+
+### Linux startup support
+
+Launch on startup detects native DEB/RPM and distribution packages, AppImage,
+Flatpak, and Snap installations. Native packages use the standard XDG
+autostart directory. Sandboxed packages request permission through the XDG
+Background Portal and may show a one-time system prompt. Startup state is
+coordinated across vaults so disabling it in one vault does not remove a
+request still owned by another vault.
 
 ## Installation
 
@@ -122,6 +132,19 @@ tray menu. Logout, restart, and shutdown always bypass this setting.
 Run in Background prevents this combination in its own settings. Launch
 Obsidian again to restore the vault if another application or macOS preference
 temporarily hides the icons.
+
+### Linux opens visibly after login
+
+Select **Only when opened at login** under **Hide on launch** and enable
+**Launch on startup** from this plugin. Remove duplicate Obsidian entries from
+your desktop environment's startup-applications tool so the unmarked launcher
+does not start a second visible session.
+
+### Sync pauses after hiding a Linux window
+
+Version 1.3.2 and newer disables Electron background throttling for hidden
+vault windows. Update the plugin and fully restart Obsidian so the new window
+lifecycle is active.
 
 ## Development and releases
 
