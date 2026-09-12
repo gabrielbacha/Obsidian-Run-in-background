@@ -29,6 +29,7 @@ export const TRAY_ICON_PRESETS = [
 export interface ComposedTrayIcon {
   previewDataUrl: string;
   representations: ReadonlyArray<{ scaleFactor: number; dataURL: string }>;
+  pixmaps: ReadonlyArray<{ width: number; height: number; data: Uint8Array }>;
 }
 
 function loadImage(dataUrl: string): Promise<HTMLImageElement> {
@@ -47,7 +48,10 @@ export function badgeTextColor(background: string): "#000000" | "#ffffff" {
   return (red * 299 + green * 587 + blue * 114) / 1000 >= 150 ? "#000000" : "#ffffff";
 }
 
-function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgroundColor: string, pixelSize: number): string {
+function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgroundColor: string, pixelSize: number): {
+  dataURL: string;
+  pixmap: { width: number; height: number; data: Uint8Array };
+} {
   const canvas = createEl("canvas");
   canvas.width = pixelSize;
   canvas.height = pixelSize;
@@ -77,14 +81,29 @@ function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgro
     const maxTextWidth = badgeWidth / scale - (visibleCharacters === 3 ? 0.5 : 2);
     context.fillText(badge, (x + badgeWidth / 2) / scale, (y + badgeHeight / 2 + 0.3 * scale) / scale, maxTextWidth);
   }
-  return canvas.toDataURL("image/png");
+  const rgba = context.getImageData(0, 0, pixelSize, pixelSize).data;
+  const argb = new Uint8Array(rgba.length);
+  for (let index = 0; index < rgba.length; index += 4) {
+    argb[index] = rgba[index + 3]!;
+    argb[index + 1] = rgba[index]!;
+    argb[index + 2] = rgba[index + 1]!;
+    argb[index + 3] = rgba[index + 2]!;
+  }
+  return {
+    dataURL: canvas.toDataURL("image/png"),
+    pixmap: { width: pixelSize, height: pixelSize, data: argb },
+  };
 }
 
 export async function composeTrayIcon(sourceDataUrl: string, badge: string, badgeBackgroundColor: string): Promise<ComposedTrayIcon> {
   const image = await loadImage(sourceDataUrl);
-  const representations = TRAY_REPRESENTATIONS.map(({ pixelSize, scaleFactor }) => ({
+  const rendered = TRAY_REPRESENTATIONS.map(({ pixelSize, scaleFactor }) => ({
     scaleFactor,
-    dataURL: drawRepresentation(image, badge, badgeBackgroundColor, pixelSize),
+    ...drawRepresentation(image, badge, badgeBackgroundColor, pixelSize),
   }));
-  return { previewDataUrl: drawRepresentation(image, badge, badgeBackgroundColor, TRAY_PREVIEW_PIXEL_SIZE), representations };
+  return {
+    previewDataUrl: drawRepresentation(image, badge, badgeBackgroundColor, TRAY_PREVIEW_PIXEL_SIZE).dataURL,
+    representations: rendered.map(({ scaleFactor, dataURL }) => ({ scaleFactor, dataURL })),
+    pixmaps: rendered.map(({ pixmap }) => pixmap),
+  };
 }

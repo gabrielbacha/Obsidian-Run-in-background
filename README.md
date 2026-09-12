@@ -140,16 +140,15 @@ Select **Only when opened at login** under **Hide on launch** and enable
 your desktop environment's startup-applications tool so the unmarked launcher
 does not start a second visible session.
 
-Each vault that enables **Launch on startup** gets its own plugin-owned startup
-entry containing that vault's exact path. This is required for multiple vaults:
-each vault must open so its plugin instance can create its own tray icon. Flatpak
-and Snap use the desktop portal for one vault and automatically switch to
-package-aware, per-vault startup entries when more than one vault is enabled.
-
-If an older version was used, the plugin removes its obsolete shared
-`run-in-background-obsidian.desktop` entry during the next settings refresh.
-It does not remove other Obsidian startup entries, so remove or correct any
-duplicate launchers you created manually in your desktop's startup settings.
+Linux uses one plugin-owned startup entry, targeted at one enabled vault. Once
+Obsidian is ready, that vault opens the other startup-enabled vaults through
+Obsidian's URI protocol. This avoids process-singleton races while ensuring a
+vault still starts after it was explicitly closed in the previous session.
+Per-vault marker records coordinate the enabled set. The plugin automatically
+removes the competing per-vault desktop entries created by version 1.3.3.
+Each Linux vault publishes its tray item on an independent D-Bus connection,
+avoiding Electron's shared StatusNotifierItem collision when several vaults are
+open in one Obsidian process.
 
 ### Sync pauses after hiding a Linux window
 

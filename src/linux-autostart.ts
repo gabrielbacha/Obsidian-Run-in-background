@@ -27,11 +27,13 @@ export interface LinuxAutostartOptions {
   requestPortal?: (enabled: boolean, command: string[]) => Promise<boolean>;
 }
 
-interface VaultStartupRecord {
-  desktopCommand: string[];
-  desktopPath: string;
-  portalCommand: string[];
+export interface VaultStartupRecord {
+  vaultPath: string;
   vaultName: string;
+}
+
+interface LegacyVaultStartupRecord extends Partial<VaultStartupRecord> {
+  desktopCommand?: unknown;
 }
 
 export class PortalPermissionDeniedError extends Error {
@@ -107,6 +109,20 @@ export function createDesktopEntry(command: string[], vaultName = "Obsidian"): s
   ].join("\n");
 }
 
+export function createVaultOpenUri(vaultName: string): string {
+  return `obsidian://open?vault=${encodeURIComponent(vaultName)}`;
+}
+
+function legacyVaultPath(command: unknown): string {
+  if (!Array.isArray(command)) return "";
+  const argumentsList = command as unknown[];
+  for (let index = argumentsList.length - 1; index >= 0; index -= 1) {
+    const argument = argumentsList[index];
+    if (typeof argument === "string" && argument.startsWith("/")) return argument;
+  }
+  return "";
+}
+
 async function defaultPortalRequest(enabled: boolean, command: string[]): Promise<boolean> {
   const bus = sessionBus({ timeout: 65_000 });
   let responseTimeout: NodeJS.Timeout | undefined;
@@ -158,7 +174,6 @@ export class LinuxAutostartManager {
   private readonly markerDirectory: string;
   private readonly markerPath: string;
   private readonly desktopPath: string;
-  private readonly legacyDesktopPath: string;
   private readonly record: VaultStartupRecord;
   private readonly requestPortal: (enabled: boolean, command: string[]) => Promise<boolean>;
 
@@ -170,72 +185,90 @@ export class LinuxAutostartManager {
     this.markerDirectory = join(configHome, "run-in-background", "autostart-vaults");
     const vaultId = createHash("sha256").update(vaultPath).digest("hex").slice(0, 20);
     this.markerPath = join(this.markerDirectory, vaultId);
-    this.desktopPath = join(this.launcher.autostartDirectory, `run-in-background-obsidian-${vaultId}.desktop`);
-    this.legacyDesktopPath = join(this.launcher.autostartDirectory, "run-in-background-obsidian.desktop");
-    this.launcher.portalCommand = this.withVaultPath(this.launcher.portalCommand, vaultPath);
-    this.launcher.desktopCommand = this.withVaultPath(this.launcher.desktopCommand, vaultPath);
+    this.desktopPath = join(this.launcher.autostartDirectory, "run-in-background-obsidian.desktop");
     this.record = {
-      desktopCommand: this.launcher.desktopCommand,
-      desktopPath: this.desktopPath,
-      portalCommand: this.launcher.portalCommand,
+      vaultPath,
       vaultName,
     };
     this.requestPortal = options.requestPortal ?? defaultPortalRequest;
   }
 
-  async setEnabled(enabled: boolean): Promise<void> {
+  async setEnabled(enabled: boolean): Promise<VaultStartupRecord[]> {
     await mkdir(this.markerDirectory, { recursive: true });
     if (enabled) await writeFile(this.markerPath, JSON.stringify(this.record));
     else await rm(this.markerPath, { force: true });
     const activeVaults = await this.readActiveVaults();
     try {
-      await this.removeLegacyDesktopEntry();
-      await this.apply(enabled, activeVaults);
+      await this.removePerVaultDesktopEntries();
+      await this.apply(activeVaults);
+      return activeVaults;
     } catch (error) {
       if (enabled) await rm(this.markerPath, { force: true });
       throw error;
     }
   }
 
-  private async apply(enabledForVault: boolean, activeVaults: VaultStartupRecord[]): Promise<void> {
+  startupCommands(activeVaults: VaultStartupRecord[], currentVaultName: string): string[][] {
+    return activeVaults
+      .filter((record) => record.vaultName !== currentVaultName)
+      .map((record) => this.withVaultUri(this.launcher.desktopCommand, record.vaultName));
+  }
+
+  async claimStartupBootstrap(): Promise<boolean> {
+    await this.removeStaleStartupClaims();
+    const sessionPath = join(this.markerDirectory, `startup-session-${process.pid}`);
+    try {
+      await writeFile(sessionPath, "", { flag: "wx" });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  }
+
+  private async removeStaleStartupClaims(): Promise<void> {
+    const current = `startup-session-${process.pid}`;
+    for (const file of await readdir(this.markerDirectory)) {
+      if (!file.startsWith("startup-session-") || file === current) continue;
+      await rm(join(this.markerDirectory, file), { force: true });
+    }
+  }
+
+  private async apply(activeVaults: VaultStartupRecord[]): Promise<void> {
+    const primary = activeVaults[0];
+    const enabled = Boolean(primary);
+    const portalCommand = primary ? this.withVaultPath(this.launcher.portalCommand, primary.vaultPath) : this.launcher.portalCommand;
     if (this.launcher.kind === "flatpak" || this.launcher.kind === "snap") {
       try {
-        if (activeVaults.length > 1) {
-          const accepted = await this.requestPortal(false, this.launcher.portalCommand);
-          if (!accepted) throw new PortalPermissionDeniedError();
-          await Promise.all(activeVaults.map((record) => this.writeDesktopEntry(record)));
-          return;
-        }
-        const remaining = activeVaults[0];
-        const accepted = await this.requestPortal(Boolean(remaining), remaining?.portalCommand ?? this.launcher.portalCommand);
+        const accepted = await this.requestPortal(enabled, portalCommand);
         if (!accepted) throw new PortalPermissionDeniedError();
         await rm(this.desktopPath, { force: true });
-        if (remaining) await rm(remaining.desktopPath, { force: true });
         return;
       } catch (error) {
         if (error instanceof PortalPermissionDeniedError) throw error;
         // A package-aware XDG entry is the permitted fallback when the portal is unavailable.
-        if (activeVaults.length > 0) {
-          await rm(this.desktopPath, { force: true });
-          await Promise.all(activeVaults.map((record) => this.writeDesktopEntry(record)));
-          return;
-        }
       }
     }
-    if (!enabledForVault) {
+    if (!primary) {
       await rm(this.desktopPath, { force: true });
       return;
     }
-    await this.writeDesktopEntry(this.record);
+    await this.writeDesktopEntry(this.withVaultPath(this.launcher.desktopCommand, primary.vaultPath));
   }
 
-  private async writeDesktopEntry(record: VaultStartupRecord): Promise<void> {
-    const command = record.desktopCommand;
+  private async writeDesktopEntry(command: string[]): Promise<void> {
     if (command[0]?.startsWith("/")) await access(command[0], constants.X_OK);
-    await mkdir(dirname(record.desktopPath), { recursive: true });
-    const temporary = `${record.desktopPath}.${process.pid}.tmp`;
-    await writeFile(temporary, createDesktopEntry(command, record.vaultName), { mode: 0o600 });
-    await rename(temporary, record.desktopPath);
+    await mkdir(dirname(this.desktopPath), { recursive: true });
+    const temporary = `${this.desktopPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    await writeFile(temporary, createDesktopEntry(command), { mode: 0o600 });
+    await rename(temporary, this.desktopPath);
+  }
+
+  private withVaultUri(command: string[], vaultName: string): string[] {
+    const markerIndex = command.indexOf(LOGIN_MARKER);
+    const uri = createVaultOpenUri(vaultName);
+    if (markerIndex < 0) return [...command, uri, LOGIN_MARKER];
+    return [...command.slice(0, markerIndex), uri, ...command.slice(markerIndex)];
   }
 
   private withVaultPath(command: string[], vaultPath: string): string[] {
@@ -244,33 +277,39 @@ export class LinuxAutostartManager {
     return [...command.slice(0, markerIndex), vaultPath, ...command.slice(markerIndex)];
   }
 
-  private async removeLegacyDesktopEntry(): Promise<void> {
-    try {
-      const contents = await readFile(this.legacyDesktopPath, "utf8");
-      if (contents.includes("X-RunInBackground-Owned=true")) {
-        await rm(this.legacyDesktopPath, { force: true });
+  private async removePerVaultDesktopEntries(): Promise<void> {
+    const files = await readdir(this.launcher.autostartDirectory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const file of files) {
+      if (!/^run-in-background-obsidian-[a-f0-9]{20}\.desktop$/u.test(file)) continue;
+      const path = join(this.launcher.autostartDirectory, file);
+      try {
+        const contents = await readFile(path, "utf8");
+        if (contents.includes("X-RunInBackground-Owned=true")) await rm(path, { force: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") throw error;
     }
   }
 
   private async readActiveVaults(): Promise<VaultStartupRecord[]> {
     const records: VaultStartupRecord[] = [];
     for (const file of await readdir(this.markerDirectory)) {
+      if (file.startsWith("startup-session-")) continue;
       try {
-        const value = JSON.parse(await readFile(join(this.markerDirectory, file), "utf8")) as Partial<VaultStartupRecord>;
-        if (
-          Array.isArray(value.desktopCommand)
-          && typeof value.desktopPath === "string"
-          && Array.isArray(value.portalCommand)
-          && typeof value.vaultName === "string"
-        ) records.push(value as VaultStartupRecord);
+        const value = JSON.parse(await readFile(join(this.markerDirectory, file), "utf8")) as LegacyVaultStartupRecord;
+        if (typeof value.vaultName === "string") {
+          const vaultPath = typeof value.vaultPath === "string"
+            ? value.vaultPath
+            : legacyVaultPath(value.desktopCommand);
+          records.push({ vaultName: value.vaultName, vaultPath });
+        }
       } catch {
         // Ignore legacy empty markers; their vault will rewrite them on its next settings refresh.
       }
     }
-    return records;
+    return records.sort((left, right) => left.vaultPath.localeCompare(right.vaultPath));
   }
 }

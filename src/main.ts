@@ -1,8 +1,10 @@
 import { FileSystemAdapter, normalizePath, Notice, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
+import { spawn } from "node:child_process";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
 import { backgroundThrottlingFor, isOtherVaultWindow, QuitLifecycle, type ExitIntent } from "./lifecycle";
 import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
+import { LinuxStatusNotifierTray } from "./linux-tray";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
 
@@ -22,6 +24,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private listeners = new Map<BrowserWindow, WindowListeners>();
   private backgroundThrottling = new Map<WebContents, boolean>();
   private tray?: Tray;
+  private linuxTray?: LinuxStatusNotifierTray;
   private settingsTab?: TraySettingsTab;
   private rootWindow?: BrowserWindow;
   private cleaned = false;
@@ -277,7 +280,22 @@ export default class RunInBackgroundPlugin extends Plugin {
     if (process.platform === "linux") {
       try {
         this.linuxAutostart ??= new LinuxAutostartManager(this.vaultPath(), this.app.vault.getName());
-        await this.linuxAutostart.setEnabled(enabled);
+        const activeVaults = await this.linuxAutostart.setEnabled(enabled);
+        const primaryVault = activeVaults[0];
+        // Electron does not consistently expose main-process launch arguments to
+        // Obsidian's renderer on Linux. The shared launcher always opens the
+        // deterministic primary vault, so let only that vault coordinate once.
+        if (enabled
+          && primaryVault?.vaultPath === this.vaultPath()
+          && await this.linuxAutostart.claimStartupBootstrap()) {
+          for (const command of this.linuxAutostart.startupCommands(activeVaults, this.app.vault.getName())) {
+            const child = spawn(command[0]!, command.slice(1), { detached: true, stdio: "ignore" });
+            child.once("error", (error) => {
+              console.error("Run in Background: unable to open startup vault", error);
+            });
+            child.unref();
+          }
+        }
       } catch (error) {
         console.error("Run in Background: unable to update Linux autostart", error);
         if (enabled) {
@@ -316,6 +334,8 @@ export default class RunInBackgroundPlugin extends Plugin {
   async createTray(): Promise<void> {
     this.safely(() => this.tray?.destroy());
     this.tray = undefined;
+    this.linuxTray?.destroy();
+    this.linuxTray = undefined;
     if (!this.settings.trayIconImage) {
       this.settings.trayIconImage = TRAY_ICON_PRESETS[0].dataUrl;
       await this.saveSettings();
@@ -328,9 +348,21 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.trayPreviewDataUrl = composed.previewDataUrl;
     this.settingsTab?.updatePreview(composed.previewDataUrl);
     if (!this.runtimeActive || !this.settings.createTrayIcon) return;
+    const vault = this.app.vault.getName();
+    if (process.platform === "linux") {
+      this.linuxTray = new LinuxStatusNotifierTray(vault, composed.pixmaps, {
+        show: () => this.showWindows(),
+        hide: () => this.hideWindows(),
+        toggle: () => this.toggleWindows(),
+        openSettings: () => this.openSettings(),
+        relaunch: () => this.relaunch(),
+        closeVault: () => window.setTimeout(() => this.closeVault(), 0),
+      });
+      await this.linuxTray.create();
+      return;
+    }
     const nativeIcon = remote.nativeImage.createEmpty();
     for (const representation of composed.representations) nativeIcon.addRepresentation(representation);
-    const vault = this.app.vault.getName();
     const menu: MenuItemConstructorOptions[] = [
       { label: `Vault: ${vault}`, enabled: false },
       { type: "separator" },
@@ -339,7 +371,7 @@ export default class RunInBackgroundPlugin extends Plugin {
       { label: "Open Plugin Settings", click: () => this.openSettings() },
       { type: "separator" },
       { label: "Relaunch Obsidian", click: () => this.relaunch() },
-      { label: "Close Vault", click: () => this.closeVault() },
+      { label: "Close Vault", click: () => window.setTimeout(() => this.closeVault(), 0) },
     ];
     this.tray = new remote.Tray(nativeIcon);
     this.tray.setContextMenu(remote.Menu.buildFromTemplate(menu));
@@ -374,10 +406,14 @@ export default class RunInBackgroundPlugin extends Plugin {
       url: candidate.webContents.getURL(),
     }));
     this.cleanup();
-    for (const trackedWindow of vaultWindows) {
-      if (!trackedWindow.isDestroyed()) trackedWindow.close();
-    }
-    if (!hasOtherVault) remote.app.quit();
+    // On Linux, Tray.destroy() unregisters the StatusNotifier item asynchronously.
+    // Let that IPC leave the menu callback before destroying the vault renderer.
+    window.setTimeout(() => {
+      for (const trackedWindow of vaultWindows) {
+        if (!trackedWindow.isDestroyed()) trackedWindow.close();
+      }
+      if (!hasOtherVault) remote.app.quit();
+    }, 0);
   }
 
   private cleanup(): void {
@@ -410,6 +446,8 @@ export default class RunInBackgroundPlugin extends Plugin {
     if (process.platform === "darwin") this.safely(() => { void remote.app.dock?.show(); });
     this.safely(() => this.tray?.destroy());
     this.tray = undefined;
+    this.linuxTray?.destroy();
+    this.linuxTray = undefined;
   }
 
   private async loadSettings(): Promise<void> {
