@@ -276,7 +276,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     const enabled = this.runtimeActive && this.settings.launchOnStartup;
     if (process.platform === "linux") {
       try {
-        this.linuxAutostart ??= new LinuxAutostartManager(this.vaultPath());
+        this.linuxAutostart ??= new LinuxAutostartManager(this.vaultPath(), this.app.vault.getName());
         await this.linuxAutostart.setEnabled(enabled);
       } catch (error) {
         console.error("Run in Background: unable to update Linux autostart", error);

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { access, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { constants } from "node:fs";
@@ -25,6 +25,13 @@ export interface LinuxAutostartOptions {
   executable?: string;
   home?: string;
   requestPortal?: (enabled: boolean, command: string[]) => Promise<boolean>;
+}
+
+interface VaultStartupRecord {
+  desktopCommand: string[];
+  desktopPath: string;
+  portalCommand: string[];
+  vaultName: string;
 }
 
 export class PortalPermissionDeniedError extends Error {
@@ -86,11 +93,12 @@ export function quoteDesktopArgument(argument: string): string {
   return `"${argument.replace(/[\\"`$]/gu, "\\$&").replace(/%/gu, "%%")}"`;
 }
 
-export function createDesktopEntry(command: string[]): string {
+export function createDesktopEntry(command: string[], vaultName = "Obsidian"): string {
+  const safeVaultName = vaultName.replace(/[\r\n]/gu, " ");
   return [
     "[Desktop Entry]",
     "Type=Application",
-    "Name=Obsidian (Run in Background)",
+    `Name=${safeVaultName} (Run in Background)`,
     `Exec=${command.map(quoteDesktopArgument).join(" ")}`,
     "Terminal=false",
     "X-GNOME-Autostart-enabled=true",
@@ -150,9 +158,11 @@ export class LinuxAutostartManager {
   private readonly markerDirectory: string;
   private readonly markerPath: string;
   private readonly desktopPath: string;
+  private readonly legacyDesktopPath: string;
+  private readonly record: VaultStartupRecord;
   private readonly requestPortal: (enabled: boolean, command: string[]) => Promise<boolean>;
 
-  constructor(vaultPath: string, options: LinuxAutostartOptions = {}) {
+  constructor(vaultPath: string, vaultName = basename(vaultPath), options: LinuxAutostartOptions = {}) {
     const env = options.env ?? process.env;
     const home = options.home ?? homedir();
     this.launcher = detectLinuxLauncher(env, options.executable ?? process.execPath, home);
@@ -160,48 +170,107 @@ export class LinuxAutostartManager {
     this.markerDirectory = join(configHome, "run-in-background", "autostart-vaults");
     const vaultId = createHash("sha256").update(vaultPath).digest("hex").slice(0, 20);
     this.markerPath = join(this.markerDirectory, vaultId);
-    this.desktopPath = join(this.launcher.autostartDirectory, "run-in-background-obsidian.desktop");
+    this.desktopPath = join(this.launcher.autostartDirectory, `run-in-background-obsidian-${vaultId}.desktop`);
+    this.legacyDesktopPath = join(this.launcher.autostartDirectory, "run-in-background-obsidian.desktop");
+    this.launcher.portalCommand = this.withVaultPath(this.launcher.portalCommand, vaultPath);
+    this.launcher.desktopCommand = this.withVaultPath(this.launcher.desktopCommand, vaultPath);
+    this.record = {
+      desktopCommand: this.launcher.desktopCommand,
+      desktopPath: this.desktopPath,
+      portalCommand: this.launcher.portalCommand,
+      vaultName,
+    };
     this.requestPortal = options.requestPortal ?? defaultPortalRequest;
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
     await mkdir(this.markerDirectory, { recursive: true });
-    if (enabled) await writeFile(this.markerPath, "", { flag: "a" });
+    if (enabled) await writeFile(this.markerPath, JSON.stringify(this.record));
     else await rm(this.markerPath, { force: true });
-    const active = (await readdir(this.markerDirectory)).length > 0;
+    const activeVaults = await this.readActiveVaults();
     try {
-      await this.apply(active);
+      await this.removeLegacyDesktopEntry();
+      await this.apply(enabled, activeVaults);
     } catch (error) {
       if (enabled) await rm(this.markerPath, { force: true });
       throw error;
     }
   }
 
-  private async apply(enabled: boolean): Promise<void> {
+  private async apply(enabledForVault: boolean, activeVaults: VaultStartupRecord[]): Promise<void> {
     if (this.launcher.kind === "flatpak" || this.launcher.kind === "snap") {
       try {
-        const accepted = await this.requestPortal(enabled, this.launcher.portalCommand);
+        if (activeVaults.length > 1) {
+          const accepted = await this.requestPortal(false, this.launcher.portalCommand);
+          if (!accepted) throw new PortalPermissionDeniedError();
+          await Promise.all(activeVaults.map((record) => this.writeDesktopEntry(record)));
+          return;
+        }
+        const remaining = activeVaults[0];
+        const accepted = await this.requestPortal(Boolean(remaining), remaining?.portalCommand ?? this.launcher.portalCommand);
         if (!accepted) throw new PortalPermissionDeniedError();
         await rm(this.desktopPath, { force: true });
+        if (remaining) await rm(remaining.desktopPath, { force: true });
         return;
       } catch (error) {
         if (error instanceof PortalPermissionDeniedError) throw error;
         // A package-aware XDG entry is the permitted fallback when the portal is unavailable.
+        if (activeVaults.length > 0) {
+          await rm(this.desktopPath, { force: true });
+          await Promise.all(activeVaults.map((record) => this.writeDesktopEntry(record)));
+          return;
+        }
       }
     }
-    if (!enabled) {
+    if (!enabledForVault) {
       await rm(this.desktopPath, { force: true });
       return;
     }
-    await this.writeDesktopEntry();
+    await this.writeDesktopEntry(this.record);
   }
 
-  private async writeDesktopEntry(): Promise<void> {
-    const command = this.launcher.desktopCommand;
+  private async writeDesktopEntry(record: VaultStartupRecord): Promise<void> {
+    const command = record.desktopCommand;
     if (command[0]?.startsWith("/")) await access(command[0], constants.X_OK);
-    await mkdir(dirname(this.desktopPath), { recursive: true });
-    const temporary = `${this.desktopPath}.${process.pid}.tmp`;
-    await writeFile(temporary, createDesktopEntry(command), { mode: 0o600 });
-    await rename(temporary, this.desktopPath);
+    await mkdir(dirname(record.desktopPath), { recursive: true });
+    const temporary = `${record.desktopPath}.${process.pid}.tmp`;
+    await writeFile(temporary, createDesktopEntry(command, record.vaultName), { mode: 0o600 });
+    await rename(temporary, record.desktopPath);
+  }
+
+  private withVaultPath(command: string[], vaultPath: string): string[] {
+    const markerIndex = command.indexOf(LOGIN_MARKER);
+    if (markerIndex < 0) return [...command, vaultPath, LOGIN_MARKER];
+    return [...command.slice(0, markerIndex), vaultPath, ...command.slice(markerIndex)];
+  }
+
+  private async removeLegacyDesktopEntry(): Promise<void> {
+    try {
+      const contents = await readFile(this.legacyDesktopPath, "utf8");
+      if (contents.includes("X-RunInBackground-Owned=true")) {
+        await rm(this.legacyDesktopPath, { force: true });
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw error;
+    }
+  }
+
+  private async readActiveVaults(): Promise<VaultStartupRecord[]> {
+    const records: VaultStartupRecord[] = [];
+    for (const file of await readdir(this.markerDirectory)) {
+      try {
+        const value = JSON.parse(await readFile(join(this.markerDirectory, file), "utf8")) as Partial<VaultStartupRecord>;
+        if (
+          Array.isArray(value.desktopCommand)
+          && typeof value.desktopPath === "string"
+          && Array.isArray(value.portalCommand)
+          && typeof value.vaultName === "string"
+        ) records.push(value as VaultStartupRecord);
+      } catch {
+        // Ignore legacy empty markers; their vault will rewrite them on its next settings refresh.
+      }
+    }
+    return records;
   }
 }
