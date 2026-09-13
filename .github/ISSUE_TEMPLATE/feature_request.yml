@@ -1,0 +1,55 @@
+name: Feature request
+description: Suggest an improvement to Run in Background.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve Run in Background.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What is difficult, slow, or currently impossible?
+    validations:
+      required: true
+  - type: textarea
+    id: requested-change
+    attributes:
+      label: Requested change
+      description: What would you like Run in Background to change or add?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: Describe how the feature should work from a user's perspective.
+    validations:
+      required: true
+  - type: input
+    id: asset-version
+    attributes:
+      label: Plugin or theme version
+      placeholder: e.g. 1.2.3
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian version
+      placeholder: e.g. 1.13.0
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 26, Windows 11, Android 16, iOS 20
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or screenshots
+      description: Add examples, mockups, screenshots, or links that clarify the request.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives currently used
+      description: How do you handle this workflow today?

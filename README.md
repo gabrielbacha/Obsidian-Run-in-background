@@ -1,9 +1,11 @@
 # Run in Background
 
-![Run in Background for Obsidian](assets/run-in-background-hero.png)
-
 Keep desktop Obsidian vaults—and Obsidian Sync—available in the background
 without blocking logout, restart, or operating-system shutdown.
+
+> Created by [Gabriel Bacha](https://www.gabrielbacha.com/?utm_source=obsidian_community&utm_medium=referral&utm_campaign=obsidian_assets&utm_content=run_in_background_readme_header) · [Visit gabrielbacha.com](https://www.gabrielbacha.com/?utm_source=obsidian_community&utm_medium=referral&utm_campaign=obsidian_assets&utm_content=run_in_background_readme_header) · [Request a feature](https://github.com/gabrielbacha/Obsidian-Run-in-background/issues/new?template=feature_request.yml)
+
+![Run in Background for Obsidian](assets/run-in-background-hero.png)
 
 Closing a vault window can hide it instead of terminating it. Restore it from
 the Dock or taskbar, by launching Obsidian again, or from a vault-specific tray

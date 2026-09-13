@@ -1,4 +1,5 @@
 import { FileSystemAdapter, normalizePath, Notice, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
+import { ABOUT_AND_FEEDBACK, BUG_REPORT_URL, FEATURE_REQUEST_URL, WEBSITE_URL } from "./external-links";
 import { spawn } from "node:child_process";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
@@ -492,6 +493,15 @@ class TraySettingsTab extends PluginSettingTab {
         },
       },
       {
+        name: ABOUT_AND_FEEDBACK.heading,
+        render: (setting: Setting) => { setting.setName(ABOUT_AND_FEEDBACK.heading).setHeading(); },
+      },
+      {
+        name: ABOUT_AND_FEEDBACK.name,
+        desc: ABOUT_AND_FEEDBACK.description,
+        render: (setting: Setting) => this.aboutAndFeedback(setting),
+      },
+      {
         type: "group",
         heading: "Window management",
         items: [
@@ -629,6 +639,8 @@ class TraySettingsTab extends PluginSettingTab {
   override display(): void {
     this.containerEl.empty();
     this.masterSwitch();
+    new Setting(this.containerEl).setName(ABOUT_AND_FEEDBACK.heading).setHeading();
+    this.aboutAndFeedback(new Setting(this.containerEl));
     new Setting(this.containerEl).setName("Window management").setHeading();
     this.toggle("Launch on startup", "Open Obsidian when you log in.", "launchOnStartup", undefined, () => this.plugin.updateLogin());
     new Setting(this.containerEl)
@@ -674,6 +686,15 @@ class TraySettingsTab extends PluginSettingTab {
       .setName("Vault badge")
       .setDesc("Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.");
     this.renderVaultBadgeControl(badgeSetting);
+  }
+
+  private aboutAndFeedback(setting: Setting): void {
+    setting
+      .setName(ABOUT_AND_FEEDBACK.name)
+      .setDesc(ABOUT_AND_FEEDBACK.description)
+      .addButton((button) => button.setButtonText(ABOUT_AND_FEEDBACK.websiteLabel).setCta().onClick(() => openExternalLink(WEBSITE_URL)))
+      .addButton((button) => button.setButtonText(ABOUT_AND_FEEDBACK.featureRequestLabel).onClick(() => openExternalLink(FEATURE_REQUEST_URL)))
+      .addButton((button) => button.setButtonText(ABOUT_AND_FEEDBACK.bugReportLabel).onClick(() => openExternalLink(BUG_REPORT_URL)));
   }
 
   private masterSwitch(): void {
@@ -798,4 +819,8 @@ class TraySettingsTab extends PluginSettingTab {
     await this.plugin.saveSettings();
     await after?.();
   }
+}
+
+function openExternalLink(url: string): void {
+  window.open(url, "_blank", "noopener,noreferrer");
 }
