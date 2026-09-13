@@ -4,7 +4,7 @@
   "author": "Gabriel Bacha",
   "authorUrl": "https://www.gabrielbacha.com/?utm_source=obsidian_community&utm_medium=referral&utm_campaign=obsidian_assets&utm_content=run_in_background_manifest",
   "description": "Keep vaults running in the background for quick access and continued Sync.",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "isDesktopOnly": true,
   "minAppVersion": "1.7.2"
 }
