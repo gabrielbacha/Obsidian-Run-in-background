@@ -1,13 +1,15 @@
-import type { App as ElectronApp, BrowserWindow, Menu, nativeImage, PowerMonitor, Tray, Event as ElectronEvent, WindowSessionEndEvent } from "electron";
+import type { App as ElectronApp, AutoUpdater, BrowserWindow, Menu, nativeImage, PowerMonitor, Tray, WindowSessionEndEvent } from "electron";
 
 export interface ElectronRemote {
   BrowserWindow: typeof BrowserWindow;
   app: ElectronApp;
   powerMonitor?: PowerMonitor;
+  autoUpdater?: AutoUpdater;
   nativeImage: typeof nativeImage;
   Tray: typeof Tray;
   Menu: typeof Menu;
   getCurrentWindow(): BrowserWindow;
+  require(module: "vm"): typeof import("node:vm");
 }
 
 export interface ElectronExports {
@@ -15,7 +17,7 @@ export interface ElectronExports {
 }
 
 export interface WindowListeners {
-  close: (event: ElectronEvent) => void;
+  close: () => void;
   closed: () => void;
   maximize: () => void;
   unmaximize: () => void;

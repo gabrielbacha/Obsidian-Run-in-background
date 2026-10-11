@@ -6,8 +6,6 @@ export type ExitIntent =
   | "system-shutdown"
   | "plugin-unload";
 
-export type UserQuitDecision = "hide" | "exit";
-
 export interface WindowIdentity {
   owned: boolean;
   destroyed: boolean;
@@ -28,19 +26,8 @@ export function backgroundThrottlingFor(runInBackground: boolean, originalValue:
 export class QuitLifecycle {
   private currentIntent: ExitIntent = "none";
 
-  requestUserQuit(keepRunningAfterQuit: boolean): UserQuitDecision {
-    if (this.currentIntent !== "none") return "exit";
-    if (keepRunningAfterQuit) return "hide";
-    this.currentIntent = "user-quit";
-    return "exit";
-  }
-
   beginExit(intent: Exclude<ExitIntent, "none">): void {
     this.currentIntent = intent;
-  }
-
-  shouldInterceptClose(runInBackground: boolean): boolean {
-    return runInBackground && this.currentIntent === "none";
   }
 
   shouldRestoreOnActivation(): boolean {
