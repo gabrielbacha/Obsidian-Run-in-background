@@ -8,6 +8,7 @@ import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
+import { installCloseGuard, type CloseGuard, type CloseGuardHost } from "./close-guard";
 
 interface WindowWithElectron extends Window {
   require(module: "electron"): ElectronExports;
@@ -15,6 +16,11 @@ interface WindowWithElectron extends Window {
 
 const electron = (window as unknown as WindowWithElectron).require("electron");
 const remote: ElectronRemote = electron.remote;
+
+/** Close and quit decisions; read them with the Obsidian CLI `dev:console` or the DevTools console. */
+const trace = (message: string, details?: Record<string, unknown>): void => {
+  console.info(`Run in Background: ${message}`, details ?? "");
+};
 
 export default class RunInBackgroundPlugin extends Plugin {
   override settings: TraySettings = defaultSettings("");
@@ -35,27 +41,18 @@ export default class RunInBackgroundPlugin extends Plugin {
   private lastSecondInstanceAt = 0;
   private linuxAutostart?: LinuxAutostartManager;
 
-  private beforeUnload = (event: BeforeUnloadEvent): void => {
-    if (!this.lifecycle.shouldInterceptClose(this.settings.runInBackground)) return;
-    event.preventDefault();
-    event.returnValue = "";
-    remote.getCurrentWindow().hide();
-  };
+  private guard?: CloseGuard;
 
-  private beforeQuit = (event: ElectronEvent): void => {
-    if (this.lifecycle.intent !== "none") {
-      this.releaseCloseInterceptors();
-      this.cleanup();
-      return;
-    }
-    if (this.lifecycle.requestUserQuit(this.settings.keepRunningAfterQuit) === "hide") {
-      event.preventDefault();
-      this.hideWindows(true);
-      return;
-    }
-    this.releaseCloseInterceptors();
+  /** Runs after the main-process guard has decided; only the follow-up work happens here. */
+  private beforeQuit = (): void => {
+    this.traceGuard();
+    if (this.lifecycle.intent === "none" && this.guard && !this.guard.quitProceeding()) return;
+    if (this.lifecycle.intent === "none") this.lifecycle.beginExit("user-quit");
     this.cleanup();
   };
+  private windowClosing = (): void => this.traceGuard();
+  /** A reload never reaches onunload, so the Electron listeners of this page are released here. */
+  private pageHidden = (): void => this.cleanup();
 
   private systemShutdown = (): void => {
     this.beginExit("system-shutdown");
@@ -113,9 +110,10 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.closeInterceptorsReleased = false;
     const current = remote.getCurrentWindow();
     this.rootWindow = current;
+    this.guard = this.installGuard(current.webContents);
     this.track(current);
     current.webContents.on("did-create-window", this.windowCreated);
-    window.addEventListener("beforeunload", this.beforeUnload);
+    window.addEventListener("pagehide", this.pageHidden);
     remote.app.on("before-quit", this.beforeQuit);
     remote.app.on("activate", this.appActivated);
     remote.app.prependListener("second-instance", this.secondInstance);
@@ -184,10 +182,34 @@ export default class RunInBackgroundPlugin extends Plugin {
   private releaseCloseInterceptors(): void {
     if (this.closeInterceptorsReleased) return;
     this.closeInterceptorsReleased = true;
-    this.safely(() => window.removeEventListener("beforeunload", this.beforeUnload));
-    for (const [trackedWindow, listeners] of this.listeners) {
-      this.safely(() => trackedWindow.removeListener("close", listeners.close));
+    trace("close interceptors released", { intent: this.lifecycle.intent });
+    this.safely(() => this.guard?.exit());
+  }
+
+  /** Compiles the guard into the main process, where its listeners run before Obsidian's unload hook. */
+  private installGuard(owner: WebContents): CloseGuard | undefined {
+    try {
+      const install = remote.require("vm").runInThisContext(`(${installCloseGuard.toString()})`) as typeof installCloseGuard;
+      const host = {
+        app: remote.app,
+        owner,
+        powerMonitor: remote.powerMonitor,
+        autoUpdater: remote.autoUpdater,
+      } as unknown as CloseGuardHost;
+      return install(host, this.closeOptions());
+    } catch (error) {
+      console.error("Run in Background: unable to install the close guard; windows close normally", error);
+      new Notice("Run in Background could not take over window closing. Check the console for details.");
+      return undefined;
     }
+  }
+
+  private closeOptions(): { runInBackground: boolean; keepRunningAfterQuit: boolean } {
+    return { runInBackground: this.settings.runInBackground, keepRunningAfterQuit: this.settings.keepRunningAfterQuit };
+  }
+
+  private traceGuard(): void {
+    for (const line of this.guard?.takeLog() ?? []) trace(line);
   }
 
   private track(trackedWindow: BrowserWindow): void {
@@ -199,12 +221,9 @@ export default class RunInBackgroundPlugin extends Plugin {
     contents.setBackgroundThrottling(backgroundThrottlingFor(this.settings.runInBackground, originalThrottling));
     if (trackedWindow.isMaximized()) this.maximized.add(trackedWindow);
     trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
+    this.safely(() => this.guard?.track(trackedWindow));
     const listeners: WindowListeners = {
-      close: (event) => {
-        if (!this.lifecycle.shouldInterceptClose(this.settings.runInBackground)) return;
-        event.preventDefault();
-        trackedWindow.hide();
-      },
+      close: this.windowClosing,
       closed: () => this.untrack(trackedWindow),
       maximize: () => this.maximized.add(trackedWindow),
       unmaximize: () => this.maximized.delete(trackedWindow),
@@ -390,8 +409,9 @@ export default class RunInBackgroundPlugin extends Plugin {
   private relaunch(): void {
     this.beginExit("relaunch");
     this.cleanup();
+    // relaunch() lets every vault's guard allow the quit; quit() (unlike exit) lets Obsidian save first.
     remote.app.relaunch();
-    remote.app.exit(0);
+    remote.app.quit();
   }
 
   private closeVault(): void {
@@ -423,6 +443,10 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.runtimeActive = false;
     this.unregisterRuntimeCommands();
     this.releaseCloseInterceptors();
+    this.traceGuard();
+    this.safely(() => this.guard?.dispose());
+    this.guard = undefined;
+    window.removeEventListener("pagehide", this.pageHidden);
     if (this.rootWindow) {
       this.safely(() => this.rootWindow?.webContents.removeListener("did-create-window", this.windowCreated));
       this.rootWindow = undefined;
@@ -470,6 +494,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    this.guard?.configure(this.closeOptions());
     await this.saveData(this.settings);
   }
 }
