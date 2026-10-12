@@ -1,11 +1,13 @@
 import { FileSystemAdapter, normalizePath, Notice, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
 import { ABOUT_AND_FEEDBACK, BUG_REPORT_URL, FEATURE_REQUEST_URL, MORE_PLUGINS_URL, WEBSITE_URL } from "./external-links";
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
 import { backgroundThrottlingFor, isOtherVaultWindow, QuitLifecycle, type ExitIntent } from "./lifecycle";
 import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
+import { LoginVaultRegistry } from "./login-vaults";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
 import { installCloseGuard, type CloseGuard, type CloseGuardHost } from "./close-guard";
@@ -16,6 +18,8 @@ interface WindowWithElectron extends Window {
 
 const electron = (window as unknown as WindowWithElectron).require("electron");
 const remote: ElectronRemote = electron.remote;
+
+const LOGIN_QUEUE = Symbol.for("run-in-background.login-queue");
 
 /** Close and quit decisions; read them with the Obsidian CLI `dev:console` or the DevTools console. */
 const trace = (message: string, details?: Record<string, unknown>): void => {
@@ -40,6 +44,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   private commandsRegistered = false;
   private lastSecondInstanceAt = 0;
   private linuxAutostart?: LinuxAutostartManager;
+  private loginVaults?: LoginVaultRegistry;
 
   private guard?: CloseGuard;
 
@@ -295,7 +300,18 @@ export default class RunInBackgroundPlugin extends Plugin {
     }
   }
 
-  async updateLogin(): Promise<void> {
+  /**
+   * The unloading and the reloaded copy of this plugin share the window, so their login updates run in
+   * order; otherwise a reload could withdraw this vault's launch-at-login after the new copy set it.
+   */
+  updateLogin(): Promise<void> {
+    const host = window as unknown as Record<symbol, Promise<void> | undefined>;
+    const next = (host[LOGIN_QUEUE] ?? Promise.resolve()).then(() => this.applyLogin());
+    host[LOGIN_QUEUE] = next.catch(() => {});
+    return next;
+  }
+
+  private async applyLogin(): Promise<void> {
     const enabled = this.runtimeActive && this.settings.launchOnStartup;
     if (process.platform === "linux") {
       try {
@@ -326,12 +342,22 @@ export default class RunInBackgroundPlugin extends Plugin {
       }
       return;
     }
-    remote.app.setLoginItemSettings({
-      openAtLogin: enabled,
-      openAsHidden: this.runtimeActive
-        && this.settings.runInBackground
-        && this.settings.hideOnLaunchMode !== "never",
-    });
+    try {
+      this.loginVaults ??= new LoginVaultRegistry(
+        join(remote.app.getPath("userData"), "run-in-background", "login-vaults"),
+        { vaultPath: this.vaultPath(), vaultName: this.app.vault.getName() },
+      );
+      const wanted = await this.loginVaults.setWanted(
+        enabled,
+        this.runtimeActive && this.settings.runInBackground && this.settings.hideOnLaunchMode !== "never",
+      );
+      remote.app.setLoginItemSettings({
+        openAtLogin: wanted.length > 0,
+        openAsHidden: wanted.some((record) => record.openAsHidden),
+      });
+    } catch (error) {
+      console.error("Run in Background: unable to update launch at login", error);
+    }
   }
 
   private vaultPath(): string {
