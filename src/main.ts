@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
-import { backgroundThrottlingFor, isOtherVaultWindow, QuitLifecycle, type ExitIntent } from "./lifecycle";
+import { backgroundThrottlingFor, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "./lifecycle";
 import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
 import { LoginVaultRegistry } from "./login-vaults";
@@ -67,14 +67,19 @@ export default class RunInBackgroundPlugin extends Plugin {
     if (this.lifecycle.shouldRestoreOnActivation()) this.showWindows();
   };
   private secondInstance = (_event: ElectronEvent, commandLine: string[]): void => {
-    this.lastSecondInstanceAt = Date.now();
     if (process.platform === "linux"
       && isLinuxLoginLaunch(commandLine)
       && this.settings.launchOnStartup
       && shouldHideOnLaunch(this.settings.hideOnLaunchMode, true)) {
+      this.lastSecondInstanceAt = Date.now();
       this.hideWindows(true);
       return;
     }
+    if (!isPlainRelaunch(commandLine)) {
+      trace("second launch with arguments left hidden vaults hidden", { commandLine });
+      return;
+    }
+    this.lastSecondInstanceAt = Date.now();
     this.appActivated();
   };
   private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {

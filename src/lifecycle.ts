@@ -23,6 +23,18 @@ export function backgroundThrottlingFor(runInBackground: boolean, originalValue:
   return runInBackground ? false : originalValue;
 }
 
+/**
+ * A second launch restores hidden vaults only when the user starts Obsidian again. The Obsidian CLI
+ * also starts the app binary, and Electron reports that as a second instance with the CLI arguments
+ * (`vault=...`, `help`, `eval`), so any argument other than a Chromium switch means "not a relaunch".
+ * The same is true for an `obsidian://` link or a file path, which Obsidian routes to one vault itself.
+ */
+export function isPlainRelaunch(commandLine: readonly string[]): boolean {
+  const [executable = "", ...rest] = commandLine;
+  const args = executable.toLowerCase().includes("electron") ? rest.slice(1) : rest;
+  return args.every((argument) => argument.startsWith("-"));
+}
+
 export class QuitLifecycle {
   private currentIntent: ExitIntent = "none";
 

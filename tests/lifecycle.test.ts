@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backgroundThrottlingFor, isOtherVaultWindow, QuitLifecycle, type ExitIntent } from "../src/lifecycle";
+import { backgroundThrottlingFor, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "../src/lifecycle";
 
 describe("QuitLifecycle", () => {
   it.each<Exclude<ExitIntent, "none">>([
@@ -22,6 +22,32 @@ describe("QuitLifecycle", () => {
     const lifecycle = new QuitLifecycle();
     lifecycle.beginExit("system-shutdown");
     expect(lifecycle.shouldSuppressTransientWindow(10_000, 10_001)).toBe(false);
+  });
+});
+
+describe("second-launch classification", () => {
+  const app = "/Applications/Obsidian.app/Contents/MacOS/Obsidian";
+
+  it("treats a launch without arguments as a relaunch", () => {
+    expect(isPlainRelaunch([app])).toBe(true);
+    expect(isPlainRelaunch([app, "--allow-file-access-from-files", "-psn_0_12345"])).toBe(true);
+    expect(isPlainRelaunch([])).toBe(true);
+  });
+
+  it("does not treat Obsidian CLI calls as a relaunch", () => {
+    expect(isPlainRelaunch([app, "vault=GB-AI-Context", "eval", "code=1"])).toBe(false);
+    expect(isPlainRelaunch([app, "help"])).toBe(false);
+    expect(isPlainRelaunch(["C:\\Obsidian\\Obsidian.exe", "session=abc", "tty", "search", "--json"])).toBe(false);
+  });
+
+  it("does not treat links or files as a relaunch", () => {
+    expect(isPlainRelaunch([app, "obsidian://open?vault=Work"])).toBe(false);
+    expect(isPlainRelaunch([app, "/Users/me/Notes/today.md"])).toBe(false);
+  });
+
+  it("skips the app path of a development Electron binary", () => {
+    expect(isPlainRelaunch(["/usr/lib/electron/electron", "/opt/obsidian/app.asar"])).toBe(true);
+    expect(isPlainRelaunch(["/usr/lib/electron/electron", "/opt/obsidian/app.asar", "help"])).toBe(false);
   });
 });
 
