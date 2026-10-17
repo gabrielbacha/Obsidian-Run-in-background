@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backgroundThrottlingFor, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "../src/lifecycle";
+import { backgroundThrottlingFor, isOpenRequestForVault, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "../src/lifecycle";
 
 describe("QuitLifecycle", () => {
   it.each<Exclude<ExitIntent, "none">>([
@@ -75,5 +75,22 @@ describe("background throttling", () => {
   it("restores the original value outside background mode", () => {
     expect(backgroundThrottlingFor(false, true)).toBe(true);
     expect(backgroundThrottlingFor(false, false)).toBe(false);
+  });
+});
+
+describe("isOpenRequestForVault", () => {
+  const vault = "/Users/me/Notes/Work";
+
+  it("matches the running vault, also through a non-normalized path", () => {
+    expect(isOpenRequestForVault(vault, false, vault)).toBe(true);
+    expect(isOpenRequestForVault("/Users/me/Notes/../Notes/Work/", undefined, vault)).toBe(true);
+  });
+
+  it("ignores other vaults, new vaults, and malformed requests", () => {
+    expect(isOpenRequestForVault("/Users/me/Notes/Home", false, vault)).toBe(false);
+    expect(isOpenRequestForVault(vault, true, vault)).toBe(false);
+    expect(isOpenRequestForVault(undefined, false, vault)).toBe(false);
+    expect(isOpenRequestForVault("", false, vault)).toBe(false);
+    expect(isOpenRequestForVault(vault, false, "")).toBe(false);
   });
 });

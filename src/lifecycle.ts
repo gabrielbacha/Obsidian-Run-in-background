@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 export type ExitIntent =
   | "none"
   | "user-quit"
@@ -33,6 +35,16 @@ export function isPlainRelaunch(commandLine: readonly string[]): boolean {
   const [executable = "", ...rest] = commandLine;
   const args = executable.toLowerCase().includes("electron") ? rest.slice(1) : rest;
   return args.every((argument) => argument.startsWith("-"));
+}
+
+/**
+ * Obsidian's vault chooser and vault switcher send `vault-open` with a folder path. For a vault that is
+ * already running, Obsidian's main process only restores a minimized window and focuses it, which does
+ * not show a hidden window. `create` is set when the chooser makes a new vault, which is never this one.
+ */
+export function isOpenRequestForVault(requestedPath: unknown, create: unknown, vaultPath: string): boolean {
+  if (create || typeof requestedPath !== "string" || requestedPath === "" || vaultPath === "") return false;
+  return resolve(requestedPath) === resolve(vaultPath);
 }
 
 export class QuitLifecycle {

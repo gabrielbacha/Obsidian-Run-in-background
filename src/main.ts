@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
-import { backgroundThrottlingFor, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "./lifecycle";
+import { backgroundThrottlingFor, isOpenRequestForVault, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "./lifecycle";
 import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
 import { LoginVaultRegistry } from "./login-vaults";
@@ -82,6 +82,12 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.lastSecondInstanceAt = Date.now();
     this.appActivated();
   };
+  /** Runs after Obsidian's own `vault-open` handler, which only focuses an already running vault. */
+  private vaultOpenRequested = (_event: ElectronEvent, requestedPath: unknown, create: unknown): void => {
+    if (!isOpenRequestForVault(requestedPath, create, this.vaultPath())) return;
+    trace("vault chooser opened this vault: showing it");
+    this.appActivated();
+  };
   private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {
     if (!this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, Date.now())) return;
     if (this.windows.has(createdWindow)) return;
@@ -128,6 +134,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     remote.app.on("activate", this.appActivated);
     remote.app.prependListener("second-instance", this.secondInstance);
     remote.app.on("browser-window-created", this.browserWindowCreated);
+    remote.ipcMain?.on("vault-open", this.vaultOpenRequested);
     remote.powerMonitor?.on("shutdown", this.systemShutdown);
     await this.createTray();
     await this.updateLogin();
@@ -486,6 +493,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.safely(() => remote.app.removeListener("activate", this.appActivated));
     this.safely(() => remote.app.removeListener("second-instance", this.secondInstance));
     this.safely(() => remote.app.removeListener("browser-window-created", this.browserWindowCreated));
+    this.safely(() => remote.ipcMain?.removeListener("vault-open", this.vaultOpenRequested));
     this.safely(() => remote.powerMonitor?.removeListener("shutdown", this.systemShutdown));
     for (const trackedWindow of [...this.windows]) {
       this.safely(() => {

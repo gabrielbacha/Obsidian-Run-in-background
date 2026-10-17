@@ -1,9 +1,10 @@
-import type { App as ElectronApp, AutoUpdater, BrowserWindow, Menu, nativeImage, PowerMonitor, Tray, WindowSessionEndEvent } from "electron";
+import type { App as ElectronApp, AutoUpdater, BrowserWindow, IpcMain, Menu, nativeImage, PowerMonitor, Tray, WindowSessionEndEvent } from "electron";
 
 export interface ElectronRemote {
   BrowserWindow: typeof BrowserWindow;
   app: ElectronApp;
   powerMonitor?: PowerMonitor;
+  ipcMain?: IpcMain;
   autoUpdater?: AutoUpdater;
   nativeImage: typeof nativeImage;
   Tray: typeof Tray;
