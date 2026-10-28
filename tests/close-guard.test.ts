@@ -13,15 +13,25 @@ class FakeEvent implements GuardEvent {
 class FakeWindow extends EventEmitter implements GuardWindow {
   closing?: boolean;
   hidden = false;
+  focused = 0;
   isDestroyed(): boolean {
     return false;
   }
   isFocused(): boolean {
     return false;
   }
+  isVisible(): boolean {
+    return !this.hidden;
+  }
   blur(): void {}
   hide(): void {
     this.hidden = true;
+  }
+  show(): void {
+    this.hidden = false;
+  }
+  focus(): void {
+    this.focused++;
   }
   /** Mirrors Obsidian's main process: its own close listener runs first and marks the window. */
   requestClose(): FakeEvent {
@@ -140,5 +150,35 @@ describe("installCloseGuard", () => {
     const window = new FakeWindow();
     guard.track(window);
     expect(window.requestClose().defaultPrevented).toBe(true);
+  });
+
+  it("shows a hidden vault when Obsidian focuses it, as for a file opened from Finder", () => {
+    const { guard, window } = setup();
+    let reveals = 0;
+    guard.revealOnFocus(window, () => reveals++);
+    window.requestClose();
+    expect(window.hidden).toBe(true);
+    window.focus();
+    expect(window.hidden).toBe(false);
+    expect(window.focused).toBe(1);
+    expect(reveals).toBe(1);
+    window.focus();
+    expect(reveals).toBe(1);
+    expect(guard.takeLog()).toContain("focus request showed the hidden vault");
+  });
+
+  it("removes the focus hook when it is disposed", () => {
+    const { guard, window } = setup();
+    guard.revealOnFocus(window, () => {
+      throw new Error("renderer gone");
+    });
+    window.hide();
+    expect(() => window.focus()).not.toThrow();
+    expect(window.hidden).toBe(false);
+    guard.dispose();
+    expect(Object.prototype.hasOwnProperty.call(window, "focus")).toBe(false);
+    window.hide();
+    window.focus();
+    expect(window.hidden).toBe(true);
   });
 });

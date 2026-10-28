@@ -4,8 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { constants } from "node:fs";
 import { sessionBus, variantValue, Variant, type DBusInterface } from "dbus-native";
-
-export const LOGIN_MARKER = "--run-in-background-login";
+import { LOGIN_MARKER } from "./lifecycle";
 
 export type LinuxPackageKind = "flatpak" | "snap" | "appimage" | "native";
 
@@ -25,6 +24,7 @@ export interface LinuxAutostartOptions {
   executable?: string;
   home?: string;
   requestPortal?: (enabled: boolean, command: string[]) => Promise<boolean>;
+  vaultExists?: (vaultPath: string) => Promise<boolean>;
 }
 
 export interface VaultStartupRecord {
@@ -87,10 +87,6 @@ export function detectLinuxLauncher(
   };
 }
 
-export function isLinuxLoginLaunch(argv: string[]): boolean {
-  return argv.includes(LOGIN_MARKER);
-}
-
 export function quoteDesktopArgument(argument: string): string {
   return `"${argument.replace(/[\\"`$]/gu, "\\$&").replace(/%/gu, "%%")}"`;
 }
@@ -121,6 +117,16 @@ function legacyVaultPath(command: unknown): string {
     if (typeof argument === "string" && argument.startsWith("/")) return argument;
   }
   return "";
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  if (path === "") return false;
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function defaultPortalRequest(enabled: boolean, command: string[]): Promise<boolean> {
@@ -176,6 +182,7 @@ export class LinuxAutostartManager {
   private readonly desktopPath: string;
   private readonly record: VaultStartupRecord;
   private readonly requestPortal: (enabled: boolean, command: string[]) => Promise<boolean>;
+  private readonly vaultExists: (vaultPath: string) => Promise<boolean>;
 
   constructor(vaultPath: string, vaultName = basename(vaultPath), options: LinuxAutostartOptions = {}) {
     const env = options.env ?? process.env;
@@ -191,6 +198,7 @@ export class LinuxAutostartManager {
       vaultName,
     };
     this.requestPortal = options.requestPortal ?? defaultPortalRequest;
+    this.vaultExists = options.vaultExists ?? pathExists;
   }
 
   async setEnabled(enabled: boolean): Promise<VaultStartupRecord[]> {
@@ -304,7 +312,9 @@ export class LinuxAutostartManager {
           const vaultPath = typeof value.vaultPath === "string"
             ? value.vaultPath
             : legacyVaultPath(value.desktopCommand);
-          records.push({ vaultName: value.vaultName, vaultPath });
+          // A deleted or moved vault cannot withdraw its marker. It must not become the primary
+          // vault, or the login entry opens a missing folder and no live vault opens the others.
+          if (await this.vaultExists(vaultPath)) records.push({ vaultName: value.vaultName, vaultPath });
         }
       } catch {
         // Ignore legacy empty markers; their vault will rewrite them on its next settings refresh.

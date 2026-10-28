@@ -6,14 +6,15 @@ import {
   createDesktopEntry,
   createVaultOpenUri,
   detectLinuxLauncher,
-  isLinuxLoginLaunch,
   LinuxAutostartManager,
-  LOGIN_MARKER,
   PortalPermissionDeniedError,
   quoteDesktopArgument,
 } from "../src/linux-autostart";
+import { isLoginLaunch, LOGIN_MARKER } from "../src/lifecycle";
 
 const temporaryDirectories: string[] = [];
+/** Test vault paths are not real folders. */
+const vaultExists = (): Promise<boolean> => Promise.resolve(true);
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { force: true, recursive: true })));
@@ -43,8 +44,8 @@ describe("Linux launcher detection", () => {
   });
 
   it("recognizes only an explicit login marker", () => {
-    expect(isLinuxLoginLaunch(["obsidian", LOGIN_MARKER])).toBe(true);
-    expect(isLinuxLoginLaunch(["obsidian"])).toBe(false);
+    expect(isLoginLaunch(["obsidian", LOGIN_MARKER])).toBe(true);
+    expect(isLoginLaunch(["obsidian"])).toBe(false);
   });
 
   it("escapes desktop entry arguments", () => {
@@ -61,8 +62,8 @@ describe("Linux autostart coordination", () => {
   it("creates one launcher for a primary vault and bootstrap commands for the others", async () => {
     const home = await temporaryHome();
     const env = { XDG_CONFIG_HOME: join(home, "config") };
-    const first = new LinuxAutostartManager("/vault/G&A Workdesk", "G&A Workdesk", { env, executable: "/bin/sh", home });
-    const second = new LinuxAutostartManager("/vault/GB-AI-Context", "GB-AI-Context", { env, executable: "/bin/sh", home });
+    const first = new LinuxAutostartManager("/vault/G&A Workdesk", "G&A Workdesk", { env, executable: "/bin/sh", home, vaultExists });
+    const second = new LinuxAutostartManager("/vault/GB-AI-Context", "GB-AI-Context", { env, executable: "/bin/sh", home, vaultExists });
     await first.setEnabled(true);
     const activeVaults = await second.setEnabled(true);
     const autostartDirectory = join(env.XDG_CONFIG_HOME, "autostart");
@@ -86,7 +87,7 @@ describe("Linux autostart coordination", () => {
     await mkdir(autostartDirectory, { recursive: true });
     const legacyPath = join(autostartDirectory, "run-in-background-obsidian-0123456789abcdef0123.desktop");
     await writeFile(legacyPath, createDesktopEntry(["/bin/sh", "/vault/one", LOGIN_MARKER]));
-    const manager = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home });
+    const manager = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home, vaultExists });
     await manager.setEnabled(true);
     await expect(readFile(legacyPath, "utf8")).rejects.toThrow();
   });
@@ -94,8 +95,8 @@ describe("Linux autostart coordination", () => {
   it("allows only one vault plugin to bootstrap a process", async () => {
     const home = await temporaryHome();
     const env = { XDG_CONFIG_HOME: join(home, "config") };
-    const first = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home });
-    const second = new LinuxAutostartManager("/vault/two", "Two", { env, executable: "/bin/sh", home });
+    const first = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home, vaultExists });
+    const second = new LinuxAutostartManager("/vault/two", "Two", { env, executable: "/bin/sh", home, vaultExists });
     await first.setEnabled(true);
     expect(await first.claimStartupBootstrap()).toBe(true);
     expect(await second.claimStartupBootstrap()).toBe(false);
@@ -104,7 +105,7 @@ describe("Linux autostart coordination", () => {
   it("removes bootstrap claims left by an earlier Obsidian process", async () => {
     const home = await temporaryHome();
     const env = { XDG_CONFIG_HOME: join(home, "config") };
-    const manager = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home });
+    const manager = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home, vaultExists });
     await manager.setEnabled(true);
     const markerDirectory = join(env.XDG_CONFIG_HOME, "run-in-background", "autostart-vaults");
     await writeFile(join(markerDirectory, "startup-session-999999"), "");
@@ -119,6 +120,7 @@ describe("Linux autostart coordination", () => {
       env: { FLATPAK_ID: "md.obsidian.Obsidian" },
       executable: "/app/obsidian",
       home,
+      vaultExists,
       requestPortal: (enabled, command) => {
         requests.push({ enabled, command });
         return Promise.resolve(true);
@@ -135,6 +137,7 @@ describe("Linux autostart coordination", () => {
       env: { FLATPAK_ID: "md.obsidian.Obsidian" },
       executable: "/bin/sh",
       home,
+      vaultExists,
       requestPortal: (enabled: boolean) => {
         requests.push(enabled);
         return Promise.resolve(true);
@@ -154,6 +157,7 @@ describe("Linux autostart coordination", () => {
       env: { FLATPAK_ID: "md.obsidian.Obsidian" },
       executable: "/app/obsidian",
       home,
+      vaultExists,
       requestPortal: () => Promise.resolve(false),
     });
     await expect(manager.setEnabled(true)).rejects.toBeInstanceOf(PortalPermissionDeniedError);
@@ -166,13 +170,29 @@ describe("Linux autostart coordination", () => {
       env: { APPIMAGE: "/missing/Obsidian.AppImage" },
       executable: "/missing/mount",
       home,
+      vaultExists,
     });
     await expect(manager.setEnabled(true)).rejects.toThrow();
     const markers = join(home, ".config", "run-in-background", "autostart-vaults");
-    const retry = new LinuxAutostartManager("/vault/working", "Working", { env: {}, executable: "/bin/sh", home });
+    const retry = new LinuxAutostartManager("/vault/working", "Working", { env: {}, executable: "/bin/sh", home, vaultExists });
     await retry.setEnabled(true);
     const entries = await readdir(join(home, ".config", "autostart"));
     expect(await readFile(join(home, ".config", "autostart", entries[0]!), "utf8")).toContain("/bin/sh");
     await rm(markers, { recursive: true, force: true });
+  });
+
+  it("ignores markers of vaults that no longer exist", async () => {
+    const home = await temporaryHome();
+    const env = { XDG_CONFIG_HOME: join(home, "config") };
+    const live = join(home, "vaults", "Live");
+    await mkdir(live, { recursive: true });
+    const deleted = new LinuxAutostartManager(join(home, "vaults", "A-Deleted"), "A-Deleted", { env, executable: "/bin/sh", home, vaultExists });
+    await deleted.setEnabled(true);
+    const manager = new LinuxAutostartManager(live, "Live", { env, executable: "/bin/sh", home });
+    const activeVaults = await manager.setEnabled(true);
+    expect(activeVaults.map((record) => record.vaultName)).toEqual(["Live"]);
+    const contents = await readFile(join(env.XDG_CONFIG_HOME, "autostart", "run-in-background-obsidian.desktop"), "utf8");
+    expect(contents).toContain(live);
+    expect(contents).not.toContain("A-Deleted");
   });
 });

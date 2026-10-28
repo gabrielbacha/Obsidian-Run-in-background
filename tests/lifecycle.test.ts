@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backgroundThrottlingFor, isOpenRequestForVault, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "../src/lifecycle";
+import { backgroundThrottlingFor, isOtherVaultWindow, isPlainRelaunch, LOGIN_LAUNCH_WINDOW_SECONDS, LOGIN_MARKER, QuitLifecycle, wasLaunchedAtLogin, type ExitIntent } from "../src/lifecycle";
 
 describe("QuitLifecycle", () => {
   it.each<Exclude<ExitIntent, "none">>([
@@ -78,19 +78,23 @@ describe("background throttling", () => {
   });
 });
 
-describe("isOpenRequestForVault", () => {
-  const vault = "/Users/me/Notes/Work";
+describe("wasLaunchedAtLogin", () => {
+  const facts = { macOpenedAtLogin: false, argv: ["Obsidian.exe"], uptimeSeconds: 5 };
 
-  it("matches the running vault, also through a non-normalized path", () => {
-    expect(isOpenRequestForVault(vault, false, vault)).toBe(true);
-    expect(isOpenRequestForVault("/Users/me/Notes/../Notes/Work/", undefined, vault)).toBe(true);
+  it("uses the login item flag on macOS", () => {
+    expect(wasLaunchedAtLogin({ ...facts, platform: "darwin", macOpenedAtLogin: true })).toBe(true);
+    expect(wasLaunchedAtLogin({ ...facts, platform: "darwin", argv: ["Obsidian", LOGIN_MARKER] })).toBe(false);
   });
 
-  it("ignores other vaults, new vaults, and malformed requests", () => {
-    expect(isOpenRequestForVault("/Users/me/Notes/Home", false, vault)).toBe(false);
-    expect(isOpenRequestForVault(vault, true, vault)).toBe(false);
-    expect(isOpenRequestForVault(undefined, false, vault)).toBe(false);
-    expect(isOpenRequestForVault("", false, vault)).toBe(false);
-    expect(isOpenRequestForVault(vault, false, "")).toBe(false);
+  it("uses the login marker on Windows and Linux", () => {
+    expect(wasLaunchedAtLogin({ ...facts, platform: "win32", argv: ["Obsidian.exe", LOGIN_MARKER] })).toBe(true);
+    expect(wasLaunchedAtLogin({ ...facts, platform: "win32", macOpenedAtLogin: true })).toBe(false);
+    expect(wasLaunchedAtLogin({ ...facts, platform: "linux", argv: ["obsidian", LOGIN_MARKER] })).toBe(true);
+  });
+
+  it("does not count a vault opened long after the login launch", () => {
+    const late = LOGIN_LAUNCH_WINDOW_SECONDS + 1;
+    expect(wasLaunchedAtLogin({ ...facts, platform: "darwin", macOpenedAtLogin: true, uptimeSeconds: late })).toBe(false);
+    expect(wasLaunchedAtLogin({ ...facts, platform: "win32", argv: ["Obsidian.exe", LOGIN_MARKER], uptimeSeconds: late })).toBe(false);
   });
 });

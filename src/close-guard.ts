@@ -25,8 +25,11 @@ export interface GuardWindow extends CancellableEmitter<"close"> {
   closing?: boolean;
   isDestroyed(): boolean;
   isFocused(): boolean;
+  isVisible(): boolean;
   blur(): void;
   hide(): void;
+  show(): void;
+  focus: (...args: unknown[]) => void;
 }
 
 export interface GuardApp extends CancellableEmitter<"before-quit"> {
@@ -45,6 +48,11 @@ export interface CloseGuardHost {
 export interface CloseGuard {
   configure(options: CloseGuardOptions): void;
   track(window: GuardWindow): void;
+  /**
+   * Obsidian brings a vault forward with `focus()` (Finder "Open with", the vault chooser and switcher),
+   * and Electron ignores `focus()` on a hidden window. Show the window first, then call `onReveal`.
+   */
+  revealOnFocus(window: GuardWindow, onReveal: () => void): void;
   /** Allow every close and quit from now on. */
   exit(): void;
   /** True while the latest app quit was not cancelled by any listener. */
@@ -69,6 +77,7 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
   let lastQuit: GuardEvent | undefined;
   const log: string[] = [];
   const windows = new Map<GuardWindow, { close: (event: GuardEvent) => void; closed: () => void }>();
+  const focusHooks = new Map<GuardWindow, { wrapped: GuardWindow["focus"]; original: GuardWindow["focus"]; owned: boolean }>();
 
   const record = (line: string): void => {
     log.push(line);
@@ -110,6 +119,34 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     window.on("session-end", stop);
   };
 
+  const revealOnFocus = (window: GuardWindow, onReveal: () => void): void => {
+    if (disposed || focusHooks.has(window)) return;
+    const owned = Object.prototype.hasOwnProperty.call(window, "focus");
+    const original = window.focus;
+    const wrapped = function (this: unknown, ...args: unknown[]): void {
+      if (!allowsEverything() && !window.isDestroyed() && !window.isVisible()) {
+        window.show();
+        record("focus request showed the hidden vault");
+        try {
+          onReveal();
+        } catch {
+          // The renderer is gone; the window is shown already.
+        }
+      }
+      original.apply(this, args);
+    };
+    window.focus = wrapped;
+    focusHooks.set(window, { wrapped, original, owned });
+  };
+  const releaseFocusHooks = (): void => {
+    for (const [window, hook] of focusHooks) {
+      if (window.focus !== hook.wrapped) continue;
+      if (hook.owned) window.focus = hook.original;
+      else delete (window as Partial<GuardWindow>).focus;
+    }
+    focusHooks.clear();
+  };
+
   const stop = (): void => {
     if (!exiting) record("system shutdown: closes allowed");
     exiting = true;
@@ -147,6 +184,7 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     if (disposed) return;
     disposed = true;
     for (const window of [...windows.keys()]) untrack(window);
+    releaseFocusHooks();
     app.removeListener("before-quit", beforeQuit);
     powerMonitor?.removeListener("shutdown", stop);
     autoUpdater?.removeListener("before-quit-for-update", beforeUpdate);
@@ -170,6 +208,7 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
       options = { ...next };
     },
     track,
+    revealOnFocus,
     exit(): void {
       exiting = true;
     },

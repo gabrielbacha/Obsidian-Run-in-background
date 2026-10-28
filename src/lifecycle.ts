@@ -1,5 +1,3 @@
-import { resolve } from "node:path";
-
 export type ExitIntent =
   | "none"
   | "user-quit"
@@ -37,15 +35,33 @@ export function isPlainRelaunch(commandLine: readonly string[]): boolean {
   return args.every((argument) => argument.startsWith("-"));
 }
 
-/**
- * Obsidian's vault chooser and vault switcher send `vault-open` with a folder path. For a vault that is
- * already running, Obsidian's main process only restores a minimized window and focuses it, which does
- * not show a hidden window. `create` is set when the chooser makes a new vault, which is never this one.
- */
-export function isOpenRequestForVault(requestedPath: unknown, create: unknown, vaultPath: string): boolean {
-  if (create || typeof requestedPath !== "string" || requestedPath === "" || vaultPath === "") return false;
-  return resolve(requestedPath) === resolve(vaultPath);
+/** Added to the launch command of the Windows login item and the Linux autostart entry. */
+export const LOGIN_MARKER = "--run-in-background-login";
+
+export function isLoginLaunch(argv: readonly string[]): boolean {
+  return argv.includes(LOGIN_MARKER);
 }
+
+/** A process opened at login stays "opened at login" all day; only vaults that load soon after count. */
+export const LOGIN_LAUNCH_WINDOW_SECONDS = 120;
+
+export interface LaunchFacts {
+  platform: NodeJS.Platform;
+  /** macOS: `app.getLoginItemSettings().wasOpenedAtLogin`. */
+  macOpenedAtLogin: boolean;
+  /** Launch arguments of the Obsidian process. */
+  argv: readonly string[];
+  /** Seconds since the Obsidian main process started. */
+  uptimeSeconds: number;
+}
+
+export function wasLaunchedAtLogin(facts: LaunchFacts): boolean {
+  if (facts.uptimeSeconds > LOGIN_LAUNCH_WINDOW_SECONDS) return false;
+  return facts.platform === "darwin" ? facts.macOpenedAtLogin : isLoginLaunch(facts.argv);
+}
+
+/** How long after a second launch a new window counts as the vault chooser that the launch opened. */
+export const SECOND_INSTANCE_SUPPRESSION_MS = 4_000;
 
 export class QuitLifecycle {
   private currentIntent: ExitIntent = "none";
@@ -59,7 +75,7 @@ export class QuitLifecycle {
   }
 
   shouldSuppressTransientWindow(lastSecondInstanceAt: number, now: number): boolean {
-    return this.currentIntent === "none" && lastSecondInstanceAt > 0 && now - lastSecondInstanceAt < 4_000;
+    return this.currentIntent === "none" && lastSecondInstanceAt > 0 && now - lastSecondInstanceAt < SECOND_INSTANCE_SUPPRESSION_MS;
   }
 
   get intent(): ExitIntent {

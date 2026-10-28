@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
 import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
-import { backgroundThrottlingFor, isOpenRequestForVault, isOtherVaultWindow, isPlainRelaunch, QuitLifecycle, type ExitIntent } from "./lifecycle";
-import { isLinuxLoginLaunch, LinuxAutostartManager } from "./linux-autostart";
+import { backgroundThrottlingFor, isLoginLaunch, isOtherVaultWindow, isPlainRelaunch, LOGIN_MARKER, QuitLifecycle, SECOND_INSTANCE_SUPPRESSION_MS, wasLaunchedAtLogin, type ExitIntent } from "./lifecycle";
+import { LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
 import { LoginVaultRegistry } from "./login-vaults";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
@@ -43,6 +43,8 @@ export default class RunInBackgroundPlugin extends Plugin {
   private runtimeActive = false;
   private commandsRegistered = false;
   private lastSecondInstanceAt = 0;
+  /** Windows hidden after a second launch, with the function that releases each one. */
+  private suppressedWindows = new Map<BrowserWindow, () => void>();
   private linuxAutostart?: LinuxAutostartManager;
   private loginVaults?: LoginVaultRegistry;
 
@@ -51,7 +53,14 @@ export default class RunInBackgroundPlugin extends Plugin {
   /** Runs after the main-process guard has decided; only the follow-up work happens here. */
   private beforeQuit = (): void => {
     this.traceGuard();
-    if (this.lifecycle.intent === "none" && this.guard && !this.guard.quitProceeding()) return;
+    if (this.lifecycle.intent === "none" && this.guard && !this.guard.quitProceeding()) {
+      // Another vault kept the app running. This vault does not keep running after Quit, so close it.
+      if (!this.settings.keepRunningAfterQuit) {
+        trace("another vault cancelled Quit: closing this vault");
+        this.closeVault();
+      }
+      return;
+    }
     if (this.lifecycle.intent === "none") this.lifecycle.beginExit("user-quit");
     this.cleanup();
   };
@@ -68,7 +77,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   };
   private secondInstance = (_event: ElectronEvent, commandLine: string[]): void => {
     if (process.platform === "linux"
-      && isLinuxLoginLaunch(commandLine)
+      && isLoginLaunch(commandLine)
       && this.settings.launchOnStartup
       && shouldHideOnLaunch(this.settings.hideOnLaunchMode, true)) {
       this.lastSecondInstanceAt = Date.now();
@@ -82,20 +91,31 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.lastSecondInstanceAt = Date.now();
     this.appActivated();
   };
-  /** Runs after Obsidian's own `vault-open` handler, which only focuses an already running vault. */
-  private vaultOpenRequested = (_event: ElectronEvent, requestedPath: unknown, create: unknown): void => {
-    if (!isOpenRequestForVault(requestedPath, create, this.vaultPath())) return;
-    trace("vault chooser opened this vault: showing it");
+  /** The guard showed the main window because Obsidian focused it; show the other vault windows too. */
+  private focusRevealed = (): void => {
+    this.traceGuard();
     this.appActivated();
   };
   private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {
-    if (!this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, Date.now())) return;
-    if (this.windows.has(createdWindow)) return;
+    const now = Date.now();
+    if (!this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, now)) return;
+    if (this.windows.has(createdWindow) || this.suppressedWindows.has(createdWindow)) return;
+    const release = (): void => {
+      if (!this.suppressedWindows.delete(createdWindow)) return;
+      this.safely(() => createdWindow.removeListener("ready-to-show", hidePicker));
+      this.safely(() => createdWindow.removeListener("show", hidePicker));
+      this.safely(() => {
+        if (!createdWindow.isDestroyed()) createdWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
+      });
+    };
     const hidePicker = (): void => {
-      if (createdWindow.isDestroyed()) return;
+      // A pop-out of this vault is reported here before did-create-window tracks it.
+      if (this.windows.has(createdWindow)) return release();
+      if (createdWindow.isDestroyed()) return release();
       createdWindow.hide();
       createdWindow.setSkipTaskbar(true);
     };
+    this.suppressedWindows.set(createdWindow, release);
     createdWindow.on("ready-to-show", hidePicker);
     createdWindow.on("show", hidePicker);
     window.setTimeout(hidePicker, 0);
@@ -103,6 +123,8 @@ export default class RunInBackgroundPlugin extends Plugin {
       hidePicker();
       this.appActivated();
     }, 150);
+    // Stop hiding the window when the suppression period ends, so a window that is not the picker can show.
+    window.setTimeout(release, Math.max(0, this.lastSecondInstanceAt + SECOND_INSTANCE_SUPPRESSION_MS - now));
   };
   private windowCreated = (createdWindow: BrowserWindow): void => this.track(createdWindow);
 
@@ -128,26 +150,50 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.rootWindow = current;
     this.guard = this.installGuard(current.webContents);
     this.track(current);
+    this.safely(() => this.guard?.revealOnFocus(current, this.focusRevealed));
     current.webContents.on("did-create-window", this.windowCreated);
     window.addEventListener("pagehide", this.pageHidden);
     remote.app.on("before-quit", this.beforeQuit);
     remote.app.on("activate", this.appActivated);
     remote.app.prependListener("second-instance", this.secondInstance);
     remote.app.on("browser-window-created", this.browserWindowCreated);
-    remote.ipcMain?.on("vault-open", this.vaultOpenRequested);
     remote.powerMonitor?.on("shutdown", this.systemShutdown);
     await this.createTray();
     await this.updateLogin();
     this.updateTaskbar();
-    const wasOpenedAtLogin = process.platform === "linux"
-      ? isLinuxLoginLaunch(process.argv)
-      : Boolean(remote.app.getLoginItemSettings().wasOpenedAtLogin);
-    if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, wasOpenedAtLogin)) {
+    if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, this.wasOpenedAtLogin())) {
       this.app.workspace.onLayoutReady(() => {
         if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows();
       });
     }
     this.registerRuntimeCommands();
+  }
+
+  /**
+   * `wasOpenedAtLogin` exists only on macOS. Windows and Linux mark the login launch with an argument
+   * of the main process, which the renderer's own `process.argv` does not always contain.
+   */
+  private wasOpenedAtLogin(): boolean {
+    const main = this.mainProcessFacts();
+    return wasLaunchedAtLogin({
+      platform: process.platform,
+      macOpenedAtLogin: process.platform === "darwin" && Boolean(remote.app.getLoginItemSettings().wasOpenedAtLogin),
+      argv: [...main.argv, ...process.argv],
+      uptimeSeconds: main.uptimeSeconds,
+    });
+  }
+
+  private mainProcessFacts(): { argv: string[]; uptimeSeconds: number } {
+    try {
+      const facts = remote.require("vm").runInThisContext("({ argv: process.argv.slice(), uptimeSeconds: process.uptime() })") as { argv: unknown; uptimeSeconds: unknown };
+      return {
+        argv: Array.isArray(facts.argv) ? facts.argv.filter((argument): argument is string => typeof argument === "string") : [],
+        uptimeSeconds: typeof facts.uptimeSeconds === "number" ? facts.uptimeSeconds : 0,
+      };
+    } catch (error) {
+      console.warn("Run in Background: unable to read the launch arguments", error);
+      return { argv: [], uptimeSeconds: 0 };
+    }
   }
 
   private registerRuntimeCommands(): void {
@@ -366,6 +412,8 @@ export default class RunInBackgroundPlugin extends Plugin {
       remote.app.setLoginItemSettings({
         openAtLogin: wanted.length > 0,
         openAsHidden: wanted.some((record) => record.openAsHidden),
+        // Windows has no wasOpenedAtLogin; the marker tells this launch apart from a normal one.
+        ...(process.platform === "win32" ? { args: [LOGIN_MARKER] } : {}),
       });
     } catch (error) {
       console.error("Run in Background: unable to update launch at login", error);
@@ -493,7 +541,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.safely(() => remote.app.removeListener("activate", this.appActivated));
     this.safely(() => remote.app.removeListener("second-instance", this.secondInstance));
     this.safely(() => remote.app.removeListener("browser-window-created", this.browserWindowCreated));
-    this.safely(() => remote.ipcMain?.removeListener("vault-open", this.vaultOpenRequested));
+    for (const release of [...this.suppressedWindows.values()]) release();
     this.safely(() => remote.powerMonitor?.removeListener("shutdown", this.systemShutdown));
     for (const trackedWindow of [...this.windows]) {
       this.safely(() => {
