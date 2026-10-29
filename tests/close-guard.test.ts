@@ -182,40 +182,84 @@ describe("installCloseGuard", () => {
     expect(window.hidden).toBe(true);
   });
 
-  it("closes windows of vaults without Run in Background when it cancels Quit", async () => {
-    const app = new FakeApp();
+  describe("a Quit while another vault keeps running", () => {
     class PlainWindow extends FakeWindow {
       closed = 0;
       close(): void {
         this.closed++;
       }
     }
-    const all: PlainWindow[] = [];
-    // Like Electron's BrowserWindow: the guard finds every window through a tracked window's class.
-    class AppWindow extends PlainWindow {
-      static getAllWindows(): PlainWindow[] {
-        return all;
+    function vaults(focus: "none" | "kept" | "quitting" | "plain") {
+      const app = new FakeApp();
+      const all: PlainWindow[] = [];
+      let focused: PlainWindow | null = null;
+      // Like Electron's BrowserWindow: the guard finds windows through a tracked window's class.
+      class AppWindow extends PlainWindow {
+        static getAllWindows(): PlainWindow[] {
+          return all;
+        }
+        static getFocusedWindow(): PlainWindow | null {
+          return focused;
+        }
       }
+      const kept = new AppWindow();
+      const quitting = new AppWindow();
+      const plain = new AppWindow();
+      all.push(kept, quitting, plain);
+      focused = focus === "none" ? null : { kept, quitting, plain }[focus];
+      const keeper = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter() }, background);
+      const other = installCloseGuard(
+        { app: app as unknown as GuardApp, owner: new EventEmitter() },
+        { runInBackground: true, keepRunningAfterQuit: false },
+      );
+      keeper.track(kept);
+      other.track(quitting);
+      return { app, kept, quitting, plain, keeper, other };
     }
-    const kept = new AppWindow();
-    const quitting = new AppWindow();
-    const plain = new AppWindow();
-    all.push(kept, quitting, plain);
-    const keeper = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter() }, background);
-    const other = installCloseGuard(
-      { app: app as unknown as GuardApp, owner: new EventEmitter() },
-      { runInBackground: true, keepRunningAfterQuit: false },
-    );
-    keeper.track(kept);
-    other.track(quitting);
-    expect(app.quit().defaultPrevented).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(kept.hidden).toBe(true);
-    expect(kept.closed).toBe(0);
-    // A vault with the plugin on closes itself, so that its tray icon is removed too.
-    expect(quitting.closed).toBe(0);
-    expect(plain.closed).toBe(1);
-    expect(keeper.takeLog()).toContain("app quit: closing 1 window(s) of vaults that do not run in background");
+    const settle = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("closes only the focused vault without Run in Background and leaves the others alone", async () => {
+      const { app, kept, quitting, plain, keeper, other } = vaults("plain");
+      expect(app.quit().defaultPrevented).toBe(true);
+      await settle();
+      expect(plain.closed).toBe(1);
+      expect(kept.hidden).toBe(false);
+      expect(quitting.closed).toBe(0);
+      expect(keeper.quitTargetsThisVault()).toBe(false);
+      expect(other.quitTargetsThisVault()).toBe(false);
+      expect(keeper.takeLog()).toContain("app quit was for another vault: this vault left as it is");
+    });
+
+    it("hides only the focused vault that keeps running", async () => {
+      const { app, kept, plain, keeper } = vaults("kept");
+      expect(app.quit().defaultPrevented).toBe(true);
+      await settle();
+      expect(kept.hidden).toBe(true);
+      expect(plain.closed).toBe(0);
+      expect(keeper.quitTargetsThisVault()).toBe(true);
+    });
+
+    it("lets only the focused vault with Quit enabled close itself", async () => {
+      const { app, kept, plain, keeper, other } = vaults("quitting");
+      expect(app.quit().defaultPrevented).toBe(true);
+      await settle();
+      expect(kept.hidden).toBe(false);
+      expect(plain.closed).toBe(0);
+      // main.ts closes this vault itself, so that its tray icon is removed too.
+      expect(other.quitTargetsThisVault()).toBe(true);
+      expect(keeper.quitTargetsThisVault()).toBe(false);
+    });
+
+    it("hides vaults that keep running and closes all others when no window is focused", async () => {
+      const { app, kept, quitting, plain, keeper, other } = vaults("none");
+      expect(app.quit().defaultPrevented).toBe(true);
+      await settle();
+      expect(kept.hidden).toBe(true);
+      expect(plain.closed).toBe(1);
+      expect(quitting.closed).toBe(0);
+      expect(other.quitTargetsThisVault()).toBe(true);
+      expect(keeper.takeLog()).toContain("app quit: closing 1 window(s) of vaults that do not run in background");
+    });
   });
 
   it("never throws from a cancelled Quit when it cannot list the app windows", () => {

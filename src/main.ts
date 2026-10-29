@@ -54,8 +54,9 @@ export default class RunInBackgroundPlugin extends Plugin {
   private beforeQuit = (): void => {
     this.traceGuard();
     if (this.lifecycle.intent === "none" && this.guard && !this.guard.quitProceeding()) {
-      // Another vault kept the app running. This vault does not keep running after Quit, so close it.
-      if (!this.settings.keepRunningAfterQuit) {
+      // Another vault kept the app running. This vault does not keep running after Quit, so close it,
+      // but only when the quit was for this vault.
+      if (!this.settings.keepRunningAfterQuit && this.guard.quitTargetsThisVault()) {
         trace("another vault cancelled Quit: closing this vault");
         this.closeVault();
       }

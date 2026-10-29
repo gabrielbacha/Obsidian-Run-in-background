@@ -43,6 +43,12 @@ export interface AnyWindow {
   close(): void;
 }
 
+/** The window that was focused when an app quit started, and the guard window map that owns it. */
+interface QuitScope {
+  focused?: AnyWindow;
+  owner?: ReadonlyMap<object, unknown>;
+}
+
 export interface CloseGuardHost {
   app: GuardApp;
   /** The vault renderer; the guard removes itself when it is gone. */
@@ -63,6 +69,8 @@ export interface CloseGuard {
   exit(): void;
   /** True while the latest app quit was not cancelled by any listener. */
   quitProceeding(): boolean;
+  /** True when the latest app quit was for this vault: its window was focused, or no window was. */
+  quitTargetsThisVault(): boolean;
   takeLog(): string[];
   dispose(): void;
 }
@@ -81,13 +89,18 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
   let relaunching = false;
   let disposed = false;
   let lastQuit: GuardEvent | undefined;
+  let lastScope: QuitScope = {};
   const log: string[] = [];
   const windows = new Map<GuardWindow, { close: (event: GuardEvent) => void; closed: () => void }>();
-  // Every guard in the main process registers its windows here, so a guard that cancels a quit can tell
-  // which windows belong to a vault that keeps running.
-  const registryKey = Symbol.for("run-in-background.close-guards");
-  const shared = app as unknown as Record<symbol, { owned: Set<ReadonlyMap<object, unknown>>; quits: WeakSet<object> } | undefined>;
-  const registry = shared[registryKey] ??= { owned: new Set(), quits: new WeakSet() };
+  // Every guard in the main process registers its windows here, so all guards agree which vault an app
+  // quit is for and which windows belong to no Run in Background vault.
+  const registryKey = Symbol.for("run-in-background.close-guards.v2");
+  const shared = app as unknown as Record<symbol, {
+    owned: Set<ReadonlyMap<object, unknown>>;
+    quits: WeakMap<object, QuitScope>;
+    closedUnowned: WeakSet<object>;
+  } | undefined>;
+  const registry = shared[registryKey] ??= { owned: new Set(), quits: new WeakMap(), closedUnowned: new WeakSet() };
   registry.owned.add(windows);
   const focusHooks = new Map<GuardWindow, { wrapped: GuardWindow["focus"]; original: GuardWindow["focus"]; owned: boolean }>();
 
@@ -163,37 +176,67 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     if (!exiting) record("system shutdown: closes allowed");
     exiting = true;
   };
+  // `remote` does not pass Electron's BrowserWindow class through intact, so take it from a tracked
+  // window: those are real main-process windows, and their constructor is BrowserWindow.
+  const windowClass = (): { getAllWindows(): AnyWindow[]; getFocusedWindow(): AnyWindow | null } | undefined => {
+    for (const map of registry.owned) {
+      for (const window of map.keys()) {
+        const type = (window as { constructor?: { getAllWindows?: unknown; getFocusedWindow?: unknown } }).constructor;
+        if (typeof type?.getAllWindows === "function" && typeof type.getFocusedWindow === "function") {
+          return type as { getAllWindows(): AnyWindow[]; getFocusedWindow(): AnyWindow | null };
+        }
+      }
+    }
+    return undefined;
+  };
+  const ownerOf = (window: AnyWindow): ReadonlyMap<object, unknown> | undefined =>
+    [...registry.owned].find((map) => map.has(window));
+  /** Decided once per quit, by the first guard that sees it, so every guard acts on the same vault. */
+  const scopeOf = (event: GuardEvent): QuitScope => {
+    const known = registry.quits.get(event);
+    if (known) return known;
+    let scope: QuitScope = {};
+    try {
+      const focused = windowClass()?.getFocusedWindow() ?? undefined;
+      if (focused && !focused.isDestroyed()) scope = { focused, owner: ownerOf(focused) };
+    } catch (error) {
+      record(`app quit: unable to find the focused window: ${String(error)}`);
+    }
+    registry.quits.set(event, scope);
+    return scope;
+  };
+  const targetsThisVault = (scope: QuitScope): boolean => !scope.focused || scope.owner === windows;
+
   const beforeQuit = (event: GuardEvent): void => {
     lastQuit = event;
+    lastScope = scopeOf(event);
     if (allowsEverything()) return record("app quit allowed: vault is exiting");
     if (!options.keepRunningAfterQuit) return record("app quit allowed");
+    // A vault that keeps running must survive every user quit, so the app quit is always cancelled.
+    // Only the vault the quit was for reacts; the other vaults stay as they are.
     event.preventDefault();
-    for (const window of windows.keys()) hide(window);
-    closeUnownedWindows(event);
+    if (targetsThisVault(lastScope)) {
+      for (const window of windows.keys()) hide(window);
+      record("app quit turned into hide");
+    } else {
+      record("app quit was for another vault: this vault left as it is");
+    }
+    closeUnownedWindows(event, lastScope);
     // Obsidian marks itself quitting on every before-quit and clears the mark only in its own activate
     // listener, registered first at startup. A cancelled quit must clear it, or Obsidian treats the next
     // reload as a quit. Renderer listeners from `remote` are skipped: they would show hidden vaults.
     const [first] = app.listeners("activate");
     if (first && first.name !== "callIntoRenderer") first();
-    record("app quit turned into hide");
   };
-  // The quit is cancelled for the whole app. Windows of vaults without Run in Background asked to quit,
-  // so close them. A vault whose plugin is on closes itself (main.ts), which also removes its tray icon.
-  // `remote` does not pass Electron's BrowserWindow class through intact, so take it from a tracked
-  // window: those are real main-process windows, and their constructor is BrowserWindow.
-  const allWindows = (): AnyWindow[] => {
-    for (const window of windows.keys()) {
-      const type = (window as { constructor?: { getAllWindows?: unknown } }).constructor;
-      if (typeof type?.getAllWindows === "function") return (type.getAllWindows as () => AnyWindow[])();
-    }
-    return [];
-  };
-  const closeUnownedWindows = (event: GuardEvent): void => {
-    if (registry.quits.has(event)) return;
-    registry.quits.add(event);
+  // Windows of vaults without Run in Background asked to quit, but the app quit is cancelled, so close
+  // them: only the focused one, or all of them when no window was focused (Quit from the Dock).
+  // A vault whose plugin is on closes itself (main.ts), which also removes its tray icon.
+  const closeUnownedWindows = (event: GuardEvent, scope: QuitScope): void => {
+    if (registry.closedUnowned.has(event)) return;
+    registry.closedUnowned.add(event);
     try {
-      const owned = (window: AnyWindow): boolean => [...registry.owned].some((map) => map.has(window));
-      const unowned = allWindows().filter((window) => !window.isDestroyed() && !owned(window));
+      const candidates = scope.focused ? [scope.focused] : windowClass()?.getAllWindows() ?? [];
+      const unowned = candidates.filter((window) => !window.isDestroyed() && !ownerOf(window));
       if (unowned.length === 0) return;
       record(`app quit: closing ${unowned.length} window(s) of vaults that do not run in background`);
       setTimeout(() => {
@@ -260,6 +303,7 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
       exiting = true;
     },
     quitProceeding,
+    quitTargetsThisVault: () => targetsThisVault(lastScope),
     takeLog(): string[] {
       return log.splice(0);
     },

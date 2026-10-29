@@ -45,7 +45,7 @@ the local desktop portal to request background and login-startup permission.
 | Action | Default behavior |
 | --- | --- |
 | Close a vault window | Hide the vault and keep it running |
-| Cmd+Q / normal Quit | Hide the vault and keep it running |
+| Cmd+Q / normal Quit | Hide the focused vault and keep it running; other vaults stay as they are |
 | Open a note from Finder (macOS), or open the vault from the vault switcher | Show the hidden vault that holds it |
 | Tray **Close Vault** | Close that vault |
 | **Relaunch Obsidian** | Exit and relaunch cleanly |
