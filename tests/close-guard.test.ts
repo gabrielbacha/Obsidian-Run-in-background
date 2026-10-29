@@ -190,13 +190,20 @@ describe("installCloseGuard", () => {
         this.closed++;
       }
     }
-    const kept = new PlainWindow();
-    const quitting = new PlainWindow();
-    const plain = new PlainWindow();
-    const windows = { getAllWindows: () => [kept, quitting, plain] };
-    const keeper = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter(), windows }, background);
+    const all: PlainWindow[] = [];
+    // Like Electron's BrowserWindow: the guard finds every window through a tracked window's class.
+    class AppWindow extends PlainWindow {
+      static getAllWindows(): PlainWindow[] {
+        return all;
+      }
+    }
+    const kept = new AppWindow();
+    const quitting = new AppWindow();
+    const plain = new AppWindow();
+    all.push(kept, quitting, plain);
+    const keeper = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter() }, background);
     const other = installCloseGuard(
-      { app: app as unknown as GuardApp, owner: new EventEmitter(), windows },
+      { app: app as unknown as GuardApp, owner: new EventEmitter() },
       { runInBackground: true, keepRunningAfterQuit: false },
     );
     keeper.track(kept);
@@ -209,5 +216,11 @@ describe("installCloseGuard", () => {
     expect(quitting.closed).toBe(0);
     expect(plain.closed).toBe(1);
     expect(keeper.takeLog()).toContain("app quit: closing 1 window(s) of vaults that do not run in background");
+  });
+
+  it("never throws from a cancelled Quit when it cannot list the app windows", () => {
+    const { app, guard } = setup();
+    expect(() => app.quit()).not.toThrow();
+    expect(guard.takeLog()).toContain("app quit turned into hide");
   });
 });

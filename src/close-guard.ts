@@ -45,8 +45,6 @@ export interface AnyWindow {
 
 export interface CloseGuardHost {
   app: GuardApp;
-  /** Electron's BrowserWindow, to find the windows that no guard owns. */
-  windows?: { getAllWindows(): AnyWindow[] };
   /** The vault renderer; the guard removes itself when it is gone. */
   owner: GuardEmitter;
   powerMonitor?: GuardEmitter;
@@ -77,7 +75,7 @@ export interface CloseGuard {
  * outside its parameters and body.
  */
 export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptions): CloseGuard {
-  const { app, owner, powerMonitor, autoUpdater, windows: allWindows } = host;
+  const { app, owner, powerMonitor, autoUpdater } = host;
   let options = { ...initial };
   let exiting = false;
   let relaunching = false;
@@ -181,18 +179,36 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
   };
   // The quit is cancelled for the whole app. Windows of vaults without Run in Background asked to quit,
   // so close them. A vault whose plugin is on closes itself (main.ts), which also removes its tray icon.
+  // `remote` does not pass Electron's BrowserWindow class through intact, so take it from a tracked
+  // window: those are real main-process windows, and their constructor is BrowserWindow.
+  const allWindows = (): AnyWindow[] => {
+    for (const window of windows.keys()) {
+      const type = (window as { constructor?: { getAllWindows?: unknown } }).constructor;
+      if (typeof type?.getAllWindows === "function") return (type.getAllWindows as () => AnyWindow[])();
+    }
+    return [];
+  };
   const closeUnownedWindows = (event: GuardEvent): void => {
-    if (!allWindows || registry.quits.has(event)) return;
+    if (registry.quits.has(event)) return;
     registry.quits.add(event);
-    const owned = (window: AnyWindow): boolean => [...registry.owned].some((map) => map.has(window));
-    const unowned = allWindows.getAllWindows().filter((window) => !window.isDestroyed() && !owned(window));
-    if (unowned.length === 0) return;
-    record(`app quit: closing ${unowned.length} window(s) of vaults that do not run in background`);
-    setTimeout(() => {
-      for (const window of unowned) {
-        if (!window.isDestroyed()) window.close();
-      }
-    }, 0);
+    try {
+      const owned = (window: AnyWindow): boolean => [...registry.owned].some((map) => map.has(window));
+      const unowned = allWindows().filter((window) => !window.isDestroyed() && !owned(window));
+      if (unowned.length === 0) return;
+      record(`app quit: closing ${unowned.length} window(s) of vaults that do not run in background`);
+      setTimeout(() => {
+        for (const window of unowned) {
+          try {
+            if (!window.isDestroyed()) window.close();
+          } catch (error) {
+            record(`app quit: a window did not close: ${String(error)}`);
+          }
+        }
+      }, 0);
+    } catch (error) {
+      // An error here must never reach Electron's main-process error dialog.
+      record(`app quit: unable to close other vault windows: ${String(error)}`);
+    }
   };
   const beforeUpdate = (): void => {
     relaunching = true;
