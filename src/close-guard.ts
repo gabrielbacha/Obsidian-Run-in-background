@@ -37,8 +37,16 @@ export interface GuardApp extends CancellableEmitter<"before-quit"> {
   listeners(event: string): ((...args: unknown[]) => unknown)[];
 }
 
+/** Any app window, also of a vault where Run in Background is off. */
+export interface AnyWindow {
+  isDestroyed(): boolean;
+  close(): void;
+}
+
 export interface CloseGuardHost {
   app: GuardApp;
+  /** Electron's BrowserWindow, to find the windows that no guard owns. */
+  windows?: { getAllWindows(): AnyWindow[] };
   /** The vault renderer; the guard removes itself when it is gone. */
   owner: GuardEmitter;
   powerMonitor?: GuardEmitter;
@@ -69,7 +77,7 @@ export interface CloseGuard {
  * outside its parameters and body.
  */
 export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptions): CloseGuard {
-  const { app, owner, powerMonitor, autoUpdater } = host;
+  const { app, owner, powerMonitor, autoUpdater, windows: allWindows } = host;
   let options = { ...initial };
   let exiting = false;
   let relaunching = false;
@@ -77,6 +85,12 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
   let lastQuit: GuardEvent | undefined;
   const log: string[] = [];
   const windows = new Map<GuardWindow, { close: (event: GuardEvent) => void; closed: () => void }>();
+  // Every guard in the main process registers its windows here, so a guard that cancels a quit can tell
+  // which windows belong to a vault that keeps running.
+  const registryKey = Symbol.for("run-in-background.close-guards");
+  const shared = app as unknown as Record<symbol, { owned: Set<ReadonlyMap<object, unknown>>; quits: WeakSet<object> } | undefined>;
+  const registry = shared[registryKey] ??= { owned: new Set(), quits: new WeakSet() };
+  registry.owned.add(windows);
   const focusHooks = new Map<GuardWindow, { wrapped: GuardWindow["focus"]; original: GuardWindow["focus"]; owned: boolean }>();
 
   const record = (line: string): void => {
@@ -157,12 +171,28 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     if (!options.keepRunningAfterQuit) return record("app quit allowed");
     event.preventDefault();
     for (const window of windows.keys()) hide(window);
+    closeUnownedWindows(event);
     // Obsidian marks itself quitting on every before-quit and clears the mark only in its own activate
     // listener, registered first at startup. A cancelled quit must clear it, or Obsidian treats the next
     // reload as a quit. Renderer listeners from `remote` are skipped: they would show hidden vaults.
     const [first] = app.listeners("activate");
     if (first && first.name !== "callIntoRenderer") first();
     record("app quit turned into hide");
+  };
+  // The quit is cancelled for the whole app. Windows of vaults without Run in Background asked to quit,
+  // so close them. A vault whose plugin is on closes itself (main.ts), which also removes its tray icon.
+  const closeUnownedWindows = (event: GuardEvent): void => {
+    if (!allWindows || registry.quits.has(event)) return;
+    registry.quits.add(event);
+    const owned = (window: AnyWindow): boolean => [...registry.owned].some((map) => map.has(window));
+    const unowned = allWindows.getAllWindows().filter((window) => !window.isDestroyed() && !owned(window));
+    if (unowned.length === 0) return;
+    record(`app quit: closing ${unowned.length} window(s) of vaults that do not run in background`);
+    setTimeout(() => {
+      for (const window of unowned) {
+        if (!window.isDestroyed()) window.close();
+      }
+    }, 0);
   };
   const beforeUpdate = (): void => {
     relaunching = true;
@@ -185,6 +215,7 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     disposed = true;
     for (const window of [...windows.keys()]) untrack(window);
     releaseFocusHooks();
+    registry.owned.delete(windows);
     app.removeListener("before-quit", beforeQuit);
     powerMonitor?.removeListener("shutdown", stop);
     autoUpdater?.removeListener("before-quit-for-update", beforeUpdate);

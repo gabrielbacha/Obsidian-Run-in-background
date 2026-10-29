@@ -181,4 +181,33 @@ describe("installCloseGuard", () => {
     window.focus();
     expect(window.hidden).toBe(true);
   });
+
+  it("closes windows of vaults without Run in Background when it cancels Quit", async () => {
+    const app = new FakeApp();
+    class PlainWindow extends FakeWindow {
+      closed = 0;
+      close(): void {
+        this.closed++;
+      }
+    }
+    const kept = new PlainWindow();
+    const quitting = new PlainWindow();
+    const plain = new PlainWindow();
+    const windows = { getAllWindows: () => [kept, quitting, plain] };
+    const keeper = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter(), windows }, background);
+    const other = installCloseGuard(
+      { app: app as unknown as GuardApp, owner: new EventEmitter(), windows },
+      { runInBackground: true, keepRunningAfterQuit: false },
+    );
+    keeper.track(kept);
+    other.track(quitting);
+    expect(app.quit().defaultPrevented).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(kept.hidden).toBe(true);
+    expect(kept.closed).toBe(0);
+    // A vault with the plugin on closes itself, so that its tray icon is removed too.
+    expect(quitting.closed).toBe(0);
+    expect(plain.closed).toBe(1);
+    expect(keeper.takeLog()).toContain("app quit: closing 1 window(s) of vaults that do not run in background");
+  });
 });

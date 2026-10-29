@@ -255,6 +255,7 @@ export default class RunInBackgroundPlugin extends Plugin {
       const install = remote.require("vm").runInThisContext(`(${installCloseGuard.toString()})`) as typeof installCloseGuard;
       const host = {
         app: remote.app,
+        windows: remote.BrowserWindow,
         owner,
         powerMonitor: remote.powerMonitor,
         autoUpdater: remote.autoUpdater,
