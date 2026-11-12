@@ -35,6 +35,11 @@ export function isPlainRelaunch(commandLine: readonly string[]): boolean {
   return args.every((argument) => argument.startsWith("-"));
 }
 
+/** Diagnostics describe a launch without storing paths, URI data or argument values. */
+export function launchDiagnostic(commandLine: readonly string[]): { kind: 'plain' | 'directed'; argumentCount: number } {
+  return { kind: isPlainRelaunch(commandLine) ? 'plain' : 'directed', argumentCount: Math.max(0, commandLine.length - 1) };
+}
+
 /** Added to the launch command of the Windows login item and the Linux autostart entry. */
 export const LOGIN_MARKER = "--run-in-background-login";
 

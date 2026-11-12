@@ -64,14 +64,21 @@ Quit command can be configured independently.
 | Hide on launch | Always, only when opened at device login, or never start hidden | Only when opened at login |
 | Run in background | Hide an ordinary window close | On |
 | Keep running after Quit command | Turn Cmd+Q / Quit into hide | On |
-| Hide Dock/taskbar icon | Remove Obsidian from the Dock or taskbar | Off |
+| Hide Dock/taskbar icon | Hide the app icon while a usable tray remains | Off |
 | Create tray icon | Create the vault menu-bar or tray icon | On |
-| Tray icon image | Select a preset or upload a square PNG/SVG | Obsidian |
+| Tray icon image | Select a preset or upload a local PNG/SVG up to 256 KiB and 2048×2048 pixels | Obsidian |
 | Vault badge | Add up to three characters, optionally separated by spaces | Vault initials |
 | Badge color | Set a vault-specific badge background with automatic contrast | Dark |
 
 For safety, hiding the Dock/taskbar icon keeps the tray icon enabled. Disabling
-the tray icon restores the Dock/taskbar icon.
+the tray icon restores the Dock/taskbar icon. If tray creation or its Linux service
+fails, the Dock/taskbar and a vault window remain available. On macOS, all active
+vaults must request hiding and have a usable tray before the shared Dock icon hides.
+
+Settings save before runtime changes. **Update status** shows pending work and
+errors; **Retry** applies the last requested values. Failed startup changes preserve
+the previous registration. Custom images are decoded before saving and normalized
+to a 64×64 PNG. Badge edits keep the same input focused and combine rapid saves.
 
 The top **Enable Run in Background** switch deactivates the entire runtime
 without disabling the community plugin. While it is off, no close or Quit
@@ -154,10 +161,13 @@ does not start a second visible session.
 
 Linux uses one plugin-owned startup entry, targeted at one enabled vault. Once
 Obsidian is ready, that vault opens the other startup-enabled vaults through
-Obsidian's URI protocol. This avoids process-singleton races while ensuring a
+exact vault paths. This avoids process-singleton races while ensuring a
 vault still starts after it was explicitly closed in the previous session.
 Per-vault marker records coordinate the enabled set. The plugin automatically
-removes the competing per-vault desktop entries created by version 1.3.3.
+removes the competing per-vault desktop entries created by version 1.3.3 only
+after the replacement succeeds. Atomic markers and a shared process lock keep the
+complete startup transaction ordered. Only a device-login launch can claim the
+shared main-process startup session; a settings change does not reopen other vaults.
 Each Linux vault publishes its tray item on an independent D-Bus connection,
 avoiding Electron's shared StatusNotifierItem collision when several vaults are
 open in one Obsidian process.

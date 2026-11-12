@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { withRegistryLock } from "./registry-lock";
+import { randomUUID, createHash } from "node:crypto";
+import { access, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface LoginVaultRecord {
@@ -26,15 +27,31 @@ export class LoginVaultRegistry {
 
   /** Records this vault's wish and returns every vault that still wants to launch at login. */
   async setWanted(wanted: boolean, openAsHidden: boolean): Promise<LoginVaultRecord[]> {
-    await mkdir(this.directory, { recursive: true });
-    if (wanted) {
-      const temporary = `${this.markerPath}.${process.pid}.tmp`;
-      await writeFile(temporary, JSON.stringify({ ...this.record, openAsHidden }), { mode: 0o600 });
-      await rename(temporary, this.markerPath);
-    } else {
-      await rm(this.markerPath, { force: true });
-    }
-    return this.readWanted();
+    return this.reconcile(wanted, openAsHidden, async () => {});
+  }
+
+  async reconcile(wanted: boolean, openAsHidden: boolean, apply: (records: LoginVaultRecord[], previous: LoginVaultRecord[]) => Promise<void>): Promise<LoginVaultRecord[]> {
+    return withRegistryLock(this.directory, async () => {
+      const prior = await readFile(this.markerPath, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+      const previous = await this.readWanted();
+      try {
+        if (wanted) await this.writeMarker(JSON.stringify({ ...this.record, openAsHidden }));
+        else await rm(this.markerPath, { force: true });
+        const current = await this.readWanted();
+        if (wanted || current.length > 0 || previous.length > 0 || prior !== undefined) await apply(current, previous);
+        return current;
+      } catch (error) {
+        if (prior === undefined) await rm(this.markerPath, { force: true });
+        else await this.writeMarker(prior);
+        throw error;
+      }
+    });
+  }
+
+  private async writeMarker(body: string): Promise<void> {
+    const temporary = `${this.markerPath}.${process.pid}.${randomUUID()}.tmp`;
+    try { await writeFile(temporary, body, { flag: "wx", mode: 0o600 }); await rename(temporary, this.markerPath); }
+    finally { await rm(temporary, { force: true }); }
   }
 
   private async readWanted(): Promise<LoginVaultRecord[]> {

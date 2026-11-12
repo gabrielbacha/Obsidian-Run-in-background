@@ -1,3 +1,4 @@
+import { withRegistryLock, processIsAlive } from "./registry-lock";
 import { createHash, randomBytes } from "node:crypto";
 import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -25,6 +26,8 @@ export interface LinuxAutostartOptions {
   home?: string;
   requestPortal?: (enabled: boolean, command: string[]) => Promise<boolean>;
   vaultExists?: (vaultPath: string) => Promise<boolean>;
+  processAlive?: (pid: number) => boolean;
+  removeLegacyEntry?: (path: string) => Promise<void>;
 }
 
 export interface VaultStartupRecord {
@@ -182,6 +185,8 @@ export class LinuxAutostartManager {
   private readonly desktopPath: string;
   private readonly record: VaultStartupRecord;
   private readonly requestPortal: (enabled: boolean, command: string[]) => Promise<boolean>;
+  private readonly processAlive: (pid: number) => boolean;
+  private readonly removeLegacyEntry: (path: string) => Promise<void>;
   private readonly vaultExists: (vaultPath: string) => Promise<boolean>;
 
   constructor(vaultPath: string, vaultName = basename(vaultPath), options: LinuxAutostartOptions = {}) {
@@ -199,47 +204,75 @@ export class LinuxAutostartManager {
     };
     this.requestPortal = options.requestPortal ?? defaultPortalRequest;
     this.vaultExists = options.vaultExists ?? pathExists;
+    this.processAlive = options.processAlive ?? processIsAlive;
+    this.removeLegacyEntry = options.removeLegacyEntry ?? (path => rm(path, { force: true }));
   }
 
   async setEnabled(enabled: boolean): Promise<VaultStartupRecord[]> {
-    await mkdir(this.markerDirectory, { recursive: true });
-    if (enabled) await writeFile(this.markerPath, JSON.stringify(this.record));
-    else await rm(this.markerPath, { force: true });
-    const activeVaults = await this.readActiveVaults();
-    try {
-      await this.removePerVaultDesktopEntries();
-      await this.apply(activeVaults);
-      return activeVaults;
-    } catch (error) {
-      if (enabled) await rm(this.markerPath, { force: true });
-      throw error;
-    }
+    return withRegistryLock(this.markerDirectory, async () => {
+      const prior = await this.readOptional(this.markerPath);
+      const priorDesktop = await this.readOptional(this.desktopPath);
+      const previous = await this.readActiveVaults();
+      const legacy = await this.ownedLegacyEntries();
+      let applied = false;
+      try {
+        if (enabled) await this.writeAtomic(this.markerPath, JSON.stringify(this.record));
+        else await rm(this.markerPath, { force: true });
+        const activeVaults = await this.readActiveVaults();
+        if (enabled || activeVaults.length > 0 || previous.length > 0 || prior !== undefined) { await this.apply(activeVaults); applied = true; }
+        // The replacement is usable before any owned legacy launcher is removed.
+        await this.removePerVaultDesktopEntries();
+        return activeVaults;
+      } catch (error) {
+        let rollbackError: unknown;
+        if (applied) { try { await this.apply(previous); } catch (failure) { rollbackError = failure; } }
+        await this.restore(this.markerPath, prior);
+        await this.restore(this.desktopPath, priorDesktop);
+        for (const [path, body] of legacy) await this.writeAtomic(path, body);
+        if (rollbackError) throw new Error("Startup update failed; prior OS registration could not be restored. Check OS startup settings before retrying.", { cause: rollbackError });
+        throw error;
+      }
+    });
   }
 
-  startupCommands(activeVaults: VaultStartupRecord[], currentVaultName: string): string[][] {
-    return activeVaults
-      .filter((record) => record.vaultName !== currentVaultName)
-      .map((record) => this.withVaultUri(this.launcher.desktopCommand, record.vaultName));
+  startupCommands(activeVaults: VaultStartupRecord[], currentVaultPath: string): string[][] {
+    return activeVaults.filter((record) => record.vaultPath !== currentVaultPath)
+      .map((record) => this.withVaultPath(this.launcher.desktopCommand, record.vaultPath));
   }
 
-  async claimStartupBootstrap(): Promise<boolean> {
-    await this.removeStaleStartupClaims();
-    const sessionPath = join(this.markerDirectory, `startup-session-${process.pid}`);
-    try {
-      await writeFile(sessionPath, "", { flag: "wx" });
+  async claimStartupBootstrap(facts: { pid: number; sessionId: string; loginLaunch: boolean }): Promise<boolean> {
+    if (!facts.loginLaunch) return false;
+    if (!Number.isSafeInteger(facts.pid) || facts.pid <= 0 || !facts.sessionId) throw new Error("Invalid main-process startup identity.");
+    return withRegistryLock(this.markerDirectory, async () => {
+      const sessionPath = join(this.markerDirectory, "startup-session-owner.json");
+      const previous = await this.readOptional(sessionPath);
+      if (previous) {
+        try {
+          const owner = JSON.parse(previous) as { pid?: number; sessionId?: string };
+          if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0 && this.processAlive(owner.pid) && !(owner.pid === facts.pid && owner.sessionId !== facts.sessionId)) return false;
+        } catch { /* An invalid claim is replaced under the shared lock. */ }
+      }
+      for (const file of await readdir(this.markerDirectory)) {
+        const match = /^startup-session-(\d+)$/u.exec(file);
+        if (match && !this.processAlive(Number(match[1]))) await rm(join(this.markerDirectory, file), { force: true });
+      }
+      await this.writeAtomic(sessionPath, JSON.stringify({ pid: facts.pid, sessionId: facts.sessionId }));
       return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
-    }
+    });
   }
 
-  private async removeStaleStartupClaims(): Promise<void> {
-    const current = `startup-session-${process.pid}`;
-    for (const file of await readdir(this.markerDirectory)) {
-      if (!file.startsWith("startup-session-") || file === current) continue;
-      await rm(join(this.markerDirectory, file), { force: true });
-    }
+  private async readOptional(path: string): Promise<string | undefined> {
+    return readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  }
+  private async restore(path: string, body: string | undefined): Promise<void> {
+    if (body === undefined) await rm(path, { force: true });
+    else await this.writeAtomic(path, body);
+  }
+  private async writeAtomic(path: string, body: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    const staged = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    try { await writeFile(staged, body, { flag: "wx", mode: 0o600 }); await rename(staged, path); }
+    finally { await rm(staged, { force: true }); }
   }
 
   private async apply(activeVaults: VaultStartupRecord[]): Promise<void> {
@@ -267,16 +300,7 @@ export class LinuxAutostartManager {
   private async writeDesktopEntry(command: string[]): Promise<void> {
     if (command[0]?.startsWith("/")) await access(command[0], constants.X_OK);
     await mkdir(dirname(this.desktopPath), { recursive: true });
-    const temporary = `${this.desktopPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-    await writeFile(temporary, createDesktopEntry(command), { mode: 0o600 });
-    await rename(temporary, this.desktopPath);
-  }
-
-  private withVaultUri(command: string[], vaultName: string): string[] {
-    const markerIndex = command.indexOf(LOGIN_MARKER);
-    const uri = createVaultOpenUri(vaultName);
-    if (markerIndex < 0) return [...command, uri, LOGIN_MARKER];
-    return [...command.slice(0, markerIndex), uri, ...command.slice(markerIndex)];
+    await this.writeAtomic(this.desktopPath, createDesktopEntry(command));
   }
 
   private withVaultPath(command: string[], vaultPath: string): string[] {
@@ -285,27 +309,23 @@ export class LinuxAutostartManager {
     return [...command.slice(0, markerIndex), vaultPath, ...command.slice(markerIndex)];
   }
 
-  private async removePerVaultDesktopEntries(): Promise<void> {
-    const files = await readdir(this.launcher.autostartDirectory).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return [];
-      throw error;
-    });
+  private async ownedLegacyEntries(): Promise<Map<string, string>> {
+    const entries = new Map<string, string>();
+    const files = await readdir(this.launcher.autostartDirectory).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; });
     for (const file of files) {
       if (!/^run-in-background-obsidian-[a-f0-9]{20}\.desktop$/u.test(file)) continue;
       const path = join(this.launcher.autostartDirectory, file);
-      try {
-        const contents = await readFile(path, "utf8");
-        if (contents.includes("X-RunInBackground-Owned=true")) await rm(path, { force: true });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
+      const contents = await this.readOptional(path);
+      if (contents?.includes("X-RunInBackground-Owned=true")) entries.set(path, contents);
     }
+    return entries;
   }
+  private async removePerVaultDesktopEntries(): Promise<void> { for (const path of (await this.ownedLegacyEntries()).keys()) await this.removeLegacyEntry(path); }
 
   private async readActiveVaults(): Promise<VaultStartupRecord[]> {
     const records: VaultStartupRecord[] = [];
     for (const file of await readdir(this.markerDirectory)) {
-      if (file.startsWith("startup-session-")) continue;
+      if (file.startsWith("startup-session-") || file.startsWith(".") || file.endsWith(".tmp")) continue;
       try {
         const value = JSON.parse(await readFile(join(this.markerDirectory, file), "utf8")) as LegacyVaultStartupRecord;
         if (typeof value.vaultName === "string") {

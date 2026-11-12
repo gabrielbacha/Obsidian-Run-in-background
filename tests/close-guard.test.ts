@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/unbound-method -- Tests compare wrapper identity without calling detached methods. */
 import { EventEmitter } from "node:events";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
@@ -266,5 +267,26 @@ describe("installCloseGuard", () => {
     const { app, guard } = setup();
     expect(() => app.quit()).not.toThrow();
     expect(guard.takeLog()).toContain("app quit turned into hide");
+  });
+});
+
+describe("registry wrappers", () => {
+  it.each([true, false])("restores the original relaunch after either unload order (%s)", first => {
+    const app = new FakeApp(), original = app.relaunch;
+    const a = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter() }, background);
+    const b = installCloseGuard({ app: app as unknown as GuardApp, owner: new EventEmitter() }, background);
+    (first ? a : b).dispose(); app.relaunch(); expect(app.relaunches).toBe(1);
+    expect((first ? a : b).takeLog()).not.toContain("relaunch: quit allowed");
+    (first ? b : a).dispose(); expect(app.relaunch).toBe(original); expect(Object.hasOwn(app, "relaunch")).toBe(false);
+  });
+  it("releases focus hooks at each popout close", () => {
+    const { guard } = setup();
+    for (let index = 0; index < 100; index++) {
+      const popout = new FakeWindow(), original = popout.focus; let calls = 0;
+      guard.track(popout); guard.revealOnFocus(popout, () => { calls++; });
+      popout.hidden = true; popout.emit("closed"); popout.focus(); expect(calls).toBe(0);
+      expect(popout.focus).toBe(original); expect(Object.hasOwn(popout, "focus")).toBe(false);
+    }
+    guard.dispose();
   });
 });

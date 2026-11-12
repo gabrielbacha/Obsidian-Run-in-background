@@ -1,9 +1,13 @@
+import { abortable } from "./async-work";
+import { installAppCoordinator, type AppCoordinator } from "./app-coordinator";
+import { traySettingDefinitions, type TraySettingDefinition } from "./settings-schema";
+import { trayMenuRows, type TrayMenuAction } from "./tray-menu";
 import { FileSystemAdapter, normalizePath, Notice, Plugin, PluginSettingTab, Setting, type App as ObsidianApp, type SettingDefinitionItem } from "obsidian";
 import { ABOUT_AND_FEEDBACK, BUG_REPORT_URL, FEATURE_REQUEST_URL, MORE_PLUGINS_URL, WEBSITE_URL } from "./external-links";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import type { BrowserWindow, Event as ElectronEvent, MenuItemConstructorOptions, Tray, WebContents } from "electron";
-import { composeTrayIcon, TRAY_ICON_PRESETS } from "./icon";
+import { composeTrayIcon, normalizeCustomIcon, MAX_ICON_BYTES, TRAY_ICON_PRESETS } from "./icon";
 import { backgroundThrottlingFor, isLoginLaunch, isOtherVaultWindow, isPlainRelaunch, LOGIN_MARKER, QuitLifecycle, SECOND_INSTANCE_SUPPRESSION_MS, wasLaunchedAtLogin, type ExitIntent } from "./lifecycle";
 import { LinuxAutostartManager } from "./linux-autostart";
 import { LinuxStatusNotifierTray } from "./linux-tray";
@@ -11,14 +15,17 @@ import { LoginVaultRegistry } from "./login-vaults";
 import { defaultSettings, migrateSettings, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch, type TraySettings } from "./settings";
 import type { AppWithSettingModal, ElectronExports, ElectronRemote, WindowListeners } from "./types";
 import { installCloseGuard, type CloseGuard, type CloseGuardHost } from "./close-guard";
+import { resolveNativeHost, compileNativeFunction } from './native-host';
+import { launchDiagnostic } from './lifecycle';
 
 interface WindowWithElectron extends Window {
   require(module: "electron"): ElectronExports;
 }
 
-const electron = (window as unknown as WindowWithElectron).require("electron");
-const remote: ElectronRemote = electron.remote;
+const nativeHost = resolveNativeHost(name => (window as unknown as WindowWithElectron).require(name as 'electron'));
+const remote = nativeHost.remote as ElectronRemote;
 
+const SETTINGS_QUEUE = Symbol.for("run-in-background.settings-queue");
 const LOGIN_QUEUE = Symbol.for("run-in-background.login-queue");
 
 /** Close and quit decisions; read them with the Obsidian CLI `dev:console` or the DevTools console. */
@@ -41,6 +48,22 @@ export default class RunInBackgroundPlugin extends Plugin {
   private cleaned = false;
   private closeInterceptorsReleased = false;
   private runtimeActive = false;
+  private loaded = false;
+  private runtimeGeneration = 0;
+  private trayVersion = 0;
+  private trayAbort?: AbortController;
+  private activating?: Promise<void>;
+  private appCoordinator?: AppCoordinator;
+  private pendingLinuxTrays = new Set<LinuxStatusNotifierTray>();
+  private windowContents = new Map<BrowserWindow, WebContents>();
+  private requestRevision = 0;
+  private desiredSettings: TraySettings = this.settings;
+  private debounceRelease?: () => void;
+  private iconInputRevision = 0;
+  operationError = "";
+  settingsPending = false;
+  startupError = "";
+
   private commandsRegistered = false;
   private lastSecondInstanceAt = 0;
   /** Windows hidden after a second launch, with the function that releases each one. */
@@ -67,7 +90,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   };
   private windowClosing = (): void => this.traceGuard();
   /** A reload never reaches onunload, so the Electron listeners of this page are released here. */
-  private pageHidden = (): void => this.cleanup();
+  private pageHidden = (): void => { this.loaded = false; this.iconInputRevision++; this.debounceRelease?.(); this.cleanup(); };
 
   private systemShutdown = (): void => {
     this.beginExit("system-shutdown");
@@ -86,7 +109,7 @@ export default class RunInBackgroundPlugin extends Plugin {
       return;
     }
     if (!isPlainRelaunch(commandLine)) {
-      trace("second launch with arguments left hidden vaults hidden", { commandLine });
+      trace("second launch with arguments left hidden vaults hidden", launchDiagnostic(commandLine));
       return;
     }
     this.lastSecondInstanceAt = Date.now();
@@ -98,76 +121,87 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.appActivated();
   };
   private browserWindowCreated = (_event: ElectronEvent, createdWindow: BrowserWindow): void => {
-    const now = Date.now();
-    if (!this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, now)) return;
-    if (this.windows.has(createdWindow) || this.suppressedWindows.has(createdWindow)) return;
+    const now = Date.now(), generation = this.runtimeGeneration;
+    if (!this.runtimeActive || !this.lifecycle.shouldSuppressTransientWindow(this.lastSecondInstanceAt, now) || this.windows.has(createdWindow) || this.suppressedWindows.has(createdWindow)) return;
+    let released = false, priorVisible = false, suppressed = false;
+    const timers = new Set<number>();
     const release = (): void => {
-      if (!this.suppressedWindows.delete(createdWindow)) return;
-      this.safely(() => createdWindow.removeListener("ready-to-show", hidePicker));
-      this.safely(() => createdWindow.removeListener("show", hidePicker));
-      this.safely(() => {
-        if (!createdWindow.isDestroyed()) createdWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
-      });
+      if (released) return;
+      released = true; this.suppressedWindows.delete(createdWindow);
+      for (const timer of timers) window.clearTimeout(timer);
+      this.safely(() => createdWindow.removeListener("closed", release));
+      this.safely(() => createdWindow.removeListener("ready-to-show", probe));
+      this.safely(() => createdWindow.removeListener("show", probe));
+      this.safely(() => createdWindow.webContents.removeListener("did-finish-load", probe));
+      this.safely(() => createdWindow.webContents.removeListener("did-start-navigation", navigation));
+      // The target's taskbar setting was never changed. Cleanup restores only its prior visibility.
+      if (suppressed && priorVisible && this.runtimeGeneration !== generation) this.safely(() => { if (!createdWindow.isDestroyed()) createdWindow.show(); });
     };
-    const hidePicker = (): void => {
-      // A pop-out of this vault is reported here before did-create-window tracks it.
-      if (this.windows.has(createdWindow)) return release();
-      if (createdWindow.isDestroyed()) return release();
-      createdWindow.hide();
-      createdWindow.setSkipTaskbar(true);
+    const navigation = (): void => { if (suppressed && priorVisible) this.safely(() => { if (!createdWindow.isDestroyed()) createdWindow.show(); }); release(); };
+    const probe = (): void => {
+      if (released || this.runtimeGeneration !== generation || !this.runtimeActive || !this.lifecycle.shouldRestoreOnActivation() || this.windows.has(createdWindow) || createdWindow.isDestroyed()) return release();
+      if (createdWindow.webContents.getURL() !== "app://obsidian.md/starter.html") return;
+      void createdWindow.webContents.executeJavaScript("document.body.classList.contains('starter') && Boolean(document.querySelector('.starter-screen'))").then((chooser: unknown) => {
+        if (chooser !== true || released || this.runtimeGeneration !== generation || !this.runtimeActive || !this.lifecycle.shouldRestoreOnActivation() || createdWindow.isDestroyed()) return;
+        if (!suppressed) {
+          priorVisible = createdWindow.isVisible(); suppressed = true;
+          createdWindow.webContents.on("did-start-navigation", navigation);
+        }
+        createdWindow.hide();
+      }).catch(() => { /* Identity is unknown; leave the window visible. */ });
     };
     this.suppressedWindows.set(createdWindow, release);
-    createdWindow.on("ready-to-show", hidePicker);
-    createdWindow.on("show", hidePicker);
-    window.setTimeout(hidePicker, 0);
-    window.setTimeout(() => {
-      hidePicker();
-      this.appActivated();
-    }, 150);
-    // Stop hiding the window when the suppression period ends, so a window that is not the picker can show.
-    window.setTimeout(release, Math.max(0, this.lastSecondInstanceAt + SECOND_INSTANCE_SUPPRESSION_MS - now));
+    createdWindow.on("closed", release); createdWindow.on("ready-to-show", probe); createdWindow.on("show", probe);
+    createdWindow.webContents.on("did-finish-load", probe);
+    timers.add(window.setTimeout(probe, 0)); timers.add(window.setTimeout(probe, 150));
+    timers.add(window.setTimeout(release, Math.max(0, this.lastSecondInstanceAt + SECOND_INSTANCE_SUPPRESSION_MS - now)));
   };
   private windowCreated = (createdWindow: BrowserWindow): void => this.track(createdWindow);
 
   override async onload(): Promise<void> {
-    await this.loadSettings();
-    this.settingsTab = new TraySettingsTab(this.app, this);
-    this.addSettingTab(this.settingsTab);
-    if (this.settings.pluginEnabled) await this.activateRuntime(true);
-    else {
-      await this.updateLogin();
-      this.updateTaskbar();
-      await this.createTray();
-    }
+    if (!nativeHost.remote) { this.startupError = nativeHost.error ?? 'Desktop host unavailable.'; new Notice(this.startupError); return; }
+    this.loaded = true;
+    let saved = true;
+    try { await this.loadSettings(); } catch (error) { saved = false; this.reportError(error); }
+    this.settingsTab = new TraySettingsTab(this.app, this); this.addSettingTab(this.settingsTab);
+    if (saved && this.settings.pluginEnabled) {
+      try { await this.activateRuntime(true); } catch (error) { this.reportError(error); }
+    } else { await this.createTray().catch((error: unknown) => this.reportError(error)); }
   }
 
-  private async activateRuntime(applyHideOnLaunch: boolean): Promise<void> {
-    if (this.runtimeActive) return;
-    this.runtimeActive = true;
-    this.lifecycle = new QuitLifecycle();
-    this.cleaned = false;
-    this.closeInterceptorsReleased = false;
-    const current = remote.getCurrentWindow();
-    this.rootWindow = current;
-    this.guard = this.installGuard(current.webContents);
-    this.track(current);
-    this.safely(() => this.guard?.revealOnFocus(current, this.focusRevealed));
-    current.webContents.on("did-create-window", this.windowCreated);
-    window.addEventListener("pagehide", this.pageHidden);
-    remote.app.on("before-quit", this.beforeQuit);
-    remote.app.on("activate", this.appActivated);
-    remote.app.prependListener("second-instance", this.secondInstance);
-    remote.app.on("browser-window-created", this.browserWindowCreated);
-    remote.powerMonitor?.on("shutdown", this.systemShutdown);
-    await this.createTray();
-    await this.updateLogin();
-    this.updateTaskbar();
-    if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, this.wasOpenedAtLogin())) {
-      this.app.workspace.onLayoutReady(() => {
-        if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows();
-      });
-    }
-    this.registerRuntimeCommands();
+  private activateRuntime(applyHideOnLaunch: boolean): Promise<void> {
+    if (this.runtimeActive) return Promise.resolve();
+    if (this.activating) return this.activating.catch(() => {}).then(() => this.runtimeActive ? undefined : this.activateRuntime(applyHideOnLaunch));
+    const activation = this.doActivateRuntime(applyHideOnLaunch);
+    this.activating = activation;
+    return activation.finally(() => { if (this.activating === activation) this.activating = undefined; });
+  }
+
+  private async doActivateRuntime(applyHideOnLaunch: boolean): Promise<void> {
+    this.lifecycle = new QuitLifecycle(); this.cleaned = false; this.closeInterceptorsReleased = false;
+    const current = remote.getCurrentWindow(); this.rootWindow = current;
+    try {
+      const install = compileNativeFunction(remote, installAppCoordinator);
+      this.appCoordinator = install(remote.app, current.webContents);
+      await this.appCoordinator.updateDock(false, false);
+      await this.createTray(true);
+      if (!this.loaded || current.isDestroyed()) throw new Error("Activation was cancelled");
+      this.guard = this.installGuard(current.webContents);
+      if (!this.guard) throw new Error("The close/quit adapter is unavailable. The vault remains visible.");
+      this.track(current); this.guard.revealOnFocus(current, this.focusRevealed);
+      current.webContents.on("did-create-window", this.windowCreated);
+      window.addEventListener("pagehide", this.pageHidden);
+      remote.app.on("before-quit", this.beforeQuit); remote.app.on("activate", this.appActivated);
+      remote.app.prependListener("second-instance", this.secondInstance);
+      remote.app.on("browser-window-created", this.browserWindowCreated);
+      remote.powerMonitor?.on("shutdown", this.systemShutdown);
+      this.runtimeActive = true;
+      await this.updateTaskbar();
+      if (applyHideOnLaunch) await this.updateLogin(true).catch((error: unknown) => this.reportError(error));
+      else await this.updateLogin();
+      if (applyHideOnLaunch && shouldHideOnLaunch(this.settings.hideOnLaunchMode, this.wasOpenedAtLogin())) this.app.workspace.onLayoutReady(() => { if (this.runtimeActive && this.settings.pluginEnabled) this.hideWindows(); });
+      this.registerRuntimeCommands();
+    } catch (error) { this.safely(() => current.show()); this.cleanup(); throw error; }
   }
 
   /**
@@ -211,23 +245,13 @@ export default class RunInBackgroundPlugin extends Plugin {
     this.commandsRegistered = false;
   }
 
-  async setPluginEnabled(enabled: boolean): Promise<void> {
-    if (this.settings.pluginEnabled === enabled && this.runtimeActive === enabled) return;
-    this.settings.pluginEnabled = enabled;
-    await this.saveSettings();
-    if (enabled) await this.activateRuntime(false);
-    else {
-      this.beginExit("plugin-unload");
-      this.cleanup();
-      await this.updateLogin();
-    }
-  }
+  async setPluginEnabled(enabled: boolean): Promise<void> { await this.requestSetting("pluginEnabled", enabled); }
 
   override onunload(): void {
     const disabledWhileRunning = this.lifecycle.intent === "none" && !this.cleaned;
-    this.beginExit("plugin-unload");
-    this.cleanup();
-    if (disabledWhileRunning) void this.updateLogin();
+    this.loaded = false; this.iconInputRevision++; this.debounceRelease?.();
+    this.beginExit("plugin-unload"); this.cleanup();
+    if (disabledWhileRunning) void this.updateLogin().catch((error: unknown) => console.warn("Run in Background: startup withdrawal failed", error));
   }
 
   private safely(action: () => void): void {
@@ -253,7 +277,7 @@ export default class RunInBackgroundPlugin extends Plugin {
   /** Compiles the guard into the main process, where its listeners run before Obsidian's unload hook. */
   private installGuard(owner: WebContents): CloseGuard | undefined {
     try {
-      const install = remote.require("vm").runInThisContext(`(${installCloseGuard.toString()})`) as typeof installCloseGuard;
+      const install = compileNativeFunction(remote, installCloseGuard);
       const host = {
         app: remote.app,
         owner,
@@ -282,9 +306,10 @@ export default class RunInBackgroundPlugin extends Plugin {
     const contents = trackedWindow.webContents;
     const originalThrottling = this.backgroundThrottling.get(contents) ?? contents.getBackgroundThrottling();
     this.backgroundThrottling.set(contents, originalThrottling);
+    this.windowContents.set(trackedWindow, contents);
     contents.setBackgroundThrottling(backgroundThrottlingFor(this.settings.runInBackground, originalThrottling));
     if (trackedWindow.isMaximized()) this.maximized.add(trackedWindow);
-    trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
+    trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon && this.hasRecoveryTray());
     this.safely(() => this.guard?.track(trackedWindow));
     const listeners: WindowListeners = {
       close: this.windowClosing,
@@ -294,7 +319,7 @@ export default class RunInBackgroundPlugin extends Plugin {
     };
     if (process.platform === "darwin") {
       listeners.focus = () => {
-        if (this.settings.hideTaskbarIcon) remote.app.dock?.hide();
+        void this.updateTaskbar();
       };
     }
     if (process.platform === "win32") {
@@ -324,6 +349,13 @@ export default class RunInBackgroundPlugin extends Plugin {
         const sessionEndListener = listeners.sessionEnd;
         this.safely(() => trackedWindow.removeListener("session-end", sessionEndListener));
       }
+    }
+    const contents = this.windowContents.get(trackedWindow);
+    this.windowContents.delete(trackedWindow);
+    if (contents) {
+      const original = this.backgroundThrottling.get(contents);
+      this.backgroundThrottling.delete(contents);
+      if (original !== undefined) this.safely(() => { if (!contents.isDestroyed()) contents.setBackgroundThrottling(original); });
     }
     this.listeners.delete(trackedWindow);
     this.windows.delete(trackedWindow);
@@ -363,14 +395,14 @@ export default class RunInBackgroundPlugin extends Plugin {
    * The unloading and the reloaded copy of this plugin share the window, so their login updates run in
    * order; otherwise a reload could withdraw this vault's launch-at-login after the new copy set it.
    */
-  updateLogin(): Promise<void> {
+  updateLogin(loginBootstrap = false): Promise<void> {
     const host = window as unknown as Record<symbol, Promise<void> | undefined>;
-    const next = (host[LOGIN_QUEUE] ?? Promise.resolve()).then(() => this.applyLogin());
+    const next = (host[LOGIN_QUEUE] ?? Promise.resolve()).then(() => this.applyLogin(loginBootstrap));
     host[LOGIN_QUEUE] = next.catch(() => {});
     return next;
   }
 
-  private async applyLogin(): Promise<void> {
+  private async applyLogin(loginBootstrap: boolean): Promise<void> {
     const enabled = this.runtimeActive && this.settings.launchOnStartup;
     if (process.platform === "linux") {
       try {
@@ -382,8 +414,9 @@ export default class RunInBackgroundPlugin extends Plugin {
         // deterministic primary vault, so let only that vault coordinate once.
         if (enabled
           && primaryVault?.vaultPath === this.vaultPath()
-          && await this.linuxAutostart.claimStartupBootstrap()) {
-          for (const command of this.linuxAutostart.startupCommands(activeVaults, this.app.vault.getName())) {
+          && loginBootstrap && this.wasOpenedAtLogin() && this.runtimeActive
+          && await this.linuxAutostart.claimStartupBootstrap({ ...this.appCoordinator!.facts(), loginLaunch: true })) {
+          for (const command of this.linuxAutostart.startupCommands(activeVaults, this.vaultPath())) {
             const child = spawn(command[0]!, command.slice(1), { detached: true, stdio: "ignore" });
             child.once("error", (error) => {
               console.error("Run in Background: unable to open startup vault", error);
@@ -391,14 +424,8 @@ export default class RunInBackgroundPlugin extends Plugin {
             child.unref();
           }
         }
-      } catch (error) {
-        console.error("Run in Background: unable to update Linux autostart", error);
-        if (enabled) {
-          this.settings.launchOnStartup = false;
-          await this.saveSettings();
-          new Notice("Run in Background could not enable launch on startup. Check the console for details.");
-        }
-      }
+        this.startupError = "";
+      } catch (error) { this.startupError = "Startup registration failed. Check Update status and retry."; throw error; }
       return;
     }
     try {
@@ -406,18 +433,19 @@ export default class RunInBackgroundPlugin extends Plugin {
         join(remote.app.getPath("userData"), "run-in-background", "login-vaults"),
         { vaultPath: this.vaultPath(), vaultName: this.app.vault.getName() },
       );
-      const wanted = await this.loginVaults.setWanted(
-        enabled,
-        this.runtimeActive && this.settings.runInBackground && this.settings.hideOnLaunchMode !== "never",
-      );
-      remote.app.setLoginItemSettings({
-        openAtLogin: wanted.length > 0,
-        openAsHidden: wanted.some((record) => record.openAsHidden),
-        // Windows has no wasOpenedAtLogin; the marker tells this launch apart from a normal one.
-        ...(process.platform === "win32" ? { args: [LOGIN_MARKER] } : {}),
+      await this.loginVaults.reconcile(enabled, this.runtimeActive && this.settings.runInBackground && this.settings.hideOnLaunchMode !== "never", (wanted) => {
+        const prior = remote.app.getLoginItemSettings();
+        try {
+          remote.app.setLoginItemSettings({ openAtLogin: wanted.length > 0, openAsHidden: wanted.some((record) => record.openAsHidden), ...(process.platform === "win32" ? { args: [LOGIN_MARKER] } : {}) });
+        } catch (error) {
+          remote.app.setLoginItemSettings({ openAtLogin: prior.openAtLogin, openAsHidden: prior.openAsHidden });
+          throw error;
+        }
+        return Promise.resolve();
       });
+      this.startupError = "";
     } catch (error) {
-      console.error("Run in Background: unable to update launch at login", error);
+      this.startupError = "Startup registration failed. Check Update status and retry."; throw error;
     }
   }
 
@@ -427,63 +455,59 @@ export default class RunInBackgroundPlugin extends Plugin {
       : this.app.vault.getName();
   }
 
-  updateTaskbar(): void {
-    if (!this.runtimeActive) {
-      if (process.platform === "darwin") void remote.app.dock?.show();
-      return;
-    }
-    for (const trackedWindow of this.windows) trackedWindow.setSkipTaskbar(this.settings.hideTaskbarIcon);
-    if (process.platform !== "darwin") return;
-    if (this.settings.hideTaskbarIcon) remote.app.dock?.hide();
-    else void remote.app.dock?.show();
+  hasRecoveryTray(): boolean { return process.platform === "linux" ? Boolean(this.linuxTray?.isAvailable()) : Boolean(this.tray && !this.tray.isDestroyed()); }
+
+  updateTaskbar(): Promise<void> {
+    const hide = this.runtimeActive && this.settings.hideTaskbarIcon && this.hasRecoveryTray();
+    for (const trackedWindow of this.windows) trackedWindow.setSkipTaskbar(hide);
+    if (this.runtimeActive && this.settings.hideTaskbarIcon && !this.hasRecoveryTray() && ![...this.windows].some((trackedWindow) => trackedWindow.isVisible())) this.showWindows();
+    return this.appCoordinator?.updateDock(hide, this.hasRecoveryTray()) ?? Promise.resolve();
   }
 
-  async createTray(): Promise<void> {
-    this.safely(() => this.tray?.destroy());
-    this.tray = undefined;
-    this.linuxTray?.destroy();
-    this.linuxTray = undefined;
-    if (!this.settings.trayIconImage) {
-      this.settings.trayIconImage = TRAY_ICON_PRESETS[0].dataUrl;
-      await this.saveSettings();
+  async createTray(forceActive = false): Promise<void> {
+    this.trayAbort?.abort(); const controller = new AbortController(); this.trayAbort = controller;
+    const version = ++this.trayVersion, generation = this.runtimeGeneration;
+    const source = this.settings.trayIconImage || TRAY_ICON_PRESETS[0].dataUrl;
+    const composed = await abortable(composeTrayIcon(source, this.settings.vaultBadge, this.settings.badgeBackgroundColor), controller.signal);
+    if (!this.loaded || version !== this.trayVersion || generation !== this.runtimeGeneration) return;
+    const wantsTray = (forceActive || this.runtimeActive) && this.settings.createTrayIcon;
+    if (!wantsTray) {
+      this.safely(() => this.tray?.destroy()); this.tray = undefined;
+      this.linuxTray?.destroy(); this.linuxTray = undefined;
+    } else if (process.platform === "linux") {
+      if (this.linuxTray) this.linuxTray.updateIcon(composed.pixmaps);
+      else {
+        const candidate = new LinuxStatusNotifierTray(this.app.vault.getName(), composed.pixmaps, {
+          show: () => this.showWindows(), hide: () => this.hideWindows(), toggle: () => this.toggleWindows(),
+          openSettings: () => this.openSettings(), relaunch: () => this.relaunch(), closeVault: () => { window.setTimeout(() => this.closeVault(), 0); },
+        }, { availability: () => { if (this.linuxTray === candidate) { void this.updateTaskbar(); this.settingsTab?.refreshStatus(); } } });
+        this.pendingLinuxTrays.add(candidate);
+        try {
+          await abortable(candidate.create(), controller.signal);
+          if (!this.loaded || version !== this.trayVersion || generation !== this.runtimeGeneration) { candidate.destroy(); return; }
+          this.linuxTray = candidate;
+        } catch (error) { candidate.destroy(); throw error; }
+        finally { this.pendingLinuxTrays.delete(candidate); }
+      }
+    } else {
+      const nativeIcon = remote.nativeImage.createEmpty();
+      for (const representation of composed.representations) nativeIcon.addRepresentation(representation);
+      if (nativeIcon.isEmpty()) throw new Error("The native tray image could not be decoded.");
+      if (this.tray && !this.tray.isDestroyed()) this.tray.setImage(nativeIcon);
+      else {
+        const candidate = new remote.Tray(nativeIcon);
+        try {
+          const actions: Record<TrayMenuAction, () => void> = { show: () => this.showWindows(), hide: () => this.hideWindows(), openSettings: () => this.openSettings(), relaunch: () => this.relaunch(), closeVault: () => { window.setTimeout(() => this.closeVault(), 0); } };
+          const menu: MenuItemConstructorOptions[] = trayMenuRows(this.app.vault.getName()).map((row) => row.separator ? { type: "separator" } : { label: row.label, enabled: row.enabled, ...(row.action ? { click: actions[row.action] } : {}) });
+          candidate.setContextMenu(remote.Menu.buildFromTemplate(menu)); candidate.setToolTip(`Vault: ${this.app.vault.getName()}`);
+          candidate.on("click", () => process.platform === "darwin" ? candidate.popUpContextMenu() : this.toggleWindows());
+          if (!this.loaded || version !== this.trayVersion || generation !== this.runtimeGeneration) { candidate.destroy(); return; }
+          this.tray = candidate;
+        } catch (error) { candidate.destroy(); throw error; }
+      }
     }
-    const composed = await composeTrayIcon(
-      this.settings.trayIconImage,
-      this.settings.vaultBadge,
-      this.settings.badgeBackgroundColor,
-    );
-    this.trayPreviewDataUrl = composed.previewDataUrl;
-    this.settingsTab?.updatePreview(composed.previewDataUrl);
-    if (!this.runtimeActive || !this.settings.createTrayIcon) return;
-    const vault = this.app.vault.getName();
-    if (process.platform === "linux") {
-      this.linuxTray = new LinuxStatusNotifierTray(vault, composed.pixmaps, {
-        show: () => this.showWindows(),
-        hide: () => this.hideWindows(),
-        toggle: () => this.toggleWindows(),
-        openSettings: () => this.openSettings(),
-        relaunch: () => this.relaunch(),
-        closeVault: () => window.setTimeout(() => this.closeVault(), 0),
-      });
-      await this.linuxTray.create();
-      return;
-    }
-    const nativeIcon = remote.nativeImage.createEmpty();
-    for (const representation of composed.representations) nativeIcon.addRepresentation(representation);
-    const menu: MenuItemConstructorOptions[] = [
-      { label: `Vault: ${vault}`, enabled: false },
-      { type: "separator" },
-      { label: "Show Vault", click: () => this.showWindows() },
-      { label: "Hide Vault", click: () => this.hideWindows() },
-      { label: "Open Plugin Settings", click: () => this.openSettings() },
-      { type: "separator" },
-      { label: "Relaunch Obsidian", click: () => this.relaunch() },
-      { label: "Close Vault", click: () => window.setTimeout(() => this.closeVault(), 0) },
-    ];
-    this.tray = new remote.Tray(nativeIcon);
-    this.tray.setContextMenu(remote.Menu.buildFromTemplate(menu));
-    this.tray.setToolTip(`Vault: ${vault}`);
-    this.tray.on("click", () => process.platform === "darwin" ? this.tray?.popUpContextMenu() : this.toggleWindows());
+    this.trayPreviewDataUrl = composed.previewDataUrl; this.settingsTab?.updatePreview(composed.previewDataUrl);
+    await this.updateTaskbar();
   }
 
   private openSettings(): void {
@@ -527,6 +551,11 @@ export default class RunInBackgroundPlugin extends Plugin {
   private cleanup(): void {
     if (this.cleaned) return;
     this.cleaned = true;
+    if (this.lifecycle.intent !== "none") this.loaded = false;
+    this.runtimeGeneration++; this.trayVersion++; this.trayAbort?.abort();
+    for (const candidate of this.pendingLinuxTrays) candidate.destroy();
+    this.pendingLinuxTrays.clear();
+    if (this.lifecycle.intent === "plugin-unload") this.safely(() => this.showWindows());
     this.runtimeActive = false;
     this.unregisterRuntimeCommands();
     this.releaseCloseInterceptors();
@@ -556,7 +585,7 @@ export default class RunInBackgroundPlugin extends Plugin {
       });
     }
     this.backgroundThrottling.clear();
-    if (process.platform === "darwin") this.safely(() => { void remote.app.dock?.show(); });
+    this.safely(() => this.appCoordinator?.release()); this.appCoordinator = undefined;
     this.safely(() => this.tray?.destroy());
     this.tray = undefined;
     this.linuxTray?.destroy();
@@ -564,10 +593,11 @@ export default class RunInBackgroundPlugin extends Plugin {
   }
 
   private async loadSettings(): Promise<void> {
+    await (window as unknown as Record<symbol, Promise<void> | undefined>)[SETTINGS_QUEUE]?.catch(() => {});
     const own = await this.loadData() as unknown;
     const hasOwn = Boolean(own && typeof own === "object" && Object.keys(own).length);
     const stored = hasOwn ? own : await this.readLegacy();
-    this.settings = migrateSettings(stored, this.app.vault.getName());
+    this.settings = migrateSettings(stored, this.app.vault.getName()); this.desiredSettings = this.settings;
     if (JSON.stringify(own) !== JSON.stringify(this.settings)) await this.saveSettings();
   }
 
@@ -581,226 +611,140 @@ export default class RunInBackgroundPlugin extends Plugin {
     }
   }
 
-  async saveSettings(): Promise<void> {
+  async saveSettings(): Promise<void> { await this.saveData(this.settings); this.guard?.configure(this.closeOptions()); }
+  getDesiredSetting(key: keyof TraySettings): TraySettings[keyof TraySettings] { return this.desiredSettings[key]; }
+  getSettingsState() { return { pending: this.settingsPending, error: this.operationError || this.startupError, recovery: this.hasRecoveryTray(), preview: this.trayPreviewDataUrl }; }
+  beginIconInput(): number { return ++this.iconInputRevision; }
+  async setTrayImage(source: string, revision = this.beginIconInput()): Promise<void> {
+    const normalized = TRAY_ICON_PRESETS.some((preset) => preset.dataUrl === source) ? source : await normalizeCustomIcon(source);
+    if (revision !== this.iconInputRevision || !this.loaded) return;
+    await this.queueSetting("trayIconImage", normalized, false);
+  }
+  requestSetting(key: keyof TraySettings, value: unknown): Promise<void> {
+    if (key === "trayIconImage") return typeof value === "string" ? this.setTrayImage(value) : Promise.reject(new Error("Choose a local PNG/SVG image."));
+    return this.queueSetting(key, value, key === "vaultBadge" || key === "badgeBackgroundColor");
+  }
+  retrySettings(): Promise<void> { return this.queueSetting(undefined, undefined, false); }
+  reportError(error: unknown): void { this.operationError = error && typeof error === "object" && "message" in error && typeof error.message === "string" ? error.message : "The update failed. Retry the request."; this.settingsTab?.refreshStatus(); new Notice(`Run in Background: ${this.operationError}`); }
+
+  private queueSetting(key: keyof TraySettings | undefined, value: unknown, deferred: boolean): Promise<void> {
+    const candidate = { ...this.desiredSettings };
+    if (key) {
+      if (typeof candidate[key] !== typeof value) return Promise.reject(new Error("Invalid setting value"));
+      (candidate as unknown as Record<string, unknown>)[key] = value;
+      if (key === "hideTaskbarIcon" || key === "createTrayIcon") reconcileRecoveryPath(candidate, key);
+    }
+    this.desiredSettings = migrateSettings(candidate, this.app.vault.getName());
+    const revision = ++this.requestRevision;
+    this.settingsPending = true; this.operationError = ""; this.settingsTab?.refreshStatus();
+    if (deferred) {
+      const desired = this.desiredSettings;
+      void composeTrayIcon(desired.trayIconImage || TRAY_ICON_PRESETS[0].dataUrl, desired.vaultBadge, desired.badgeBackgroundColor).then(composed => {
+        if (this.loaded && revision === this.requestRevision) this.settingsTab?.updatePreview(composed.previewDataUrl);
+      }).catch(() => {});
+    }
+    if (!key || ["pluginEnabled", "trayIconImage", "vaultBadge", "badgeBackgroundColor", "createTrayIcon"].includes(key)) this.trayAbort?.abort();
+    this.debounceRelease?.();
+    let timer: number | undefined;
+    const delay = deferred ? new Promise<void>((resolve) => { this.debounceRelease = () => { if (timer) window.clearTimeout(timer); resolve(); }; timer = window.setTimeout(resolve, 150); }) : Promise.resolve();
+    const host = window as unknown as Record<symbol, Promise<void> | undefined>;
+    const next = (host[SETTINGS_QUEUE] ?? Promise.resolve()).catch(() => {}).then(async () => {
+      await delay;
+      if (revision !== this.requestRevision) return;
+      const prior = { ...this.settings }, wanted = { ...this.desiredSettings };
+      let saved = false;
+      try {
+        await this.saveData(wanted); saved = true;
+        if (revision !== this.requestRevision) { await this.saveData(prior); return; }
+        this.settings = wanted;
+        if (this.loaded) await this.applySettings(prior);
+        this.operationError = "";
+      } catch (error) {
+        if (revision !== this.requestRevision) return;
+        this.settings = prior;
+        if (saved) { try { await this.saveData(prior); } catch (rollbackError) { this.reportError(new Error(`The update failed and the saved settings could not be restored: ${String(rollbackError)}`)); throw rollbackError; } if (this.loaded) await this.applySettings(wanted, true).catch(() => {}); }
+        this.reportError(error); throw error;
+      } finally { if (revision === this.requestRevision) { this.settingsPending = false; this.settingsTab?.refreshStatus(); } }
+    });
+    host[SETTINGS_QUEUE] = next.catch(() => {});
+    return next;
+  }
+
+  private async applySettings(prior: TraySettings, skipStartup = false): Promise<void> {
+    if (this.settings.pluginEnabled && !this.runtimeActive) { await this.activateRuntime(false); return; }
+    if (!this.settings.pluginEnabled && this.runtimeActive) { this.showWindows(); this.cleanup(); }
     this.guard?.configure(this.closeOptions());
-    await this.saveData(this.settings);
+    if (this.settings.runInBackground !== prior.runInBackground) { this.updateBackgroundMode(); if (this.runtimeActive) this.showWindows(); }
+    if (this.settings.trayIconImage !== prior.trayIconImage || this.settings.vaultBadge !== prior.vaultBadge || this.settings.badgeBackgroundColor !== prior.badgeBackgroundColor || this.settings.createTrayIcon !== prior.createTrayIcon) await this.createTray();
+    await this.updateTaskbar();
+    if (!skipStartup && (this.startupError || this.settings.launchOnStartup !== prior.launchOnStartup || this.settings.hideOnLaunchMode !== prior.hideOnLaunchMode || this.settings.runInBackground !== prior.runInBackground || this.settings.pluginEnabled !== prior.pluginEnabled)) await this.updateLogin();
   }
 }
 
 class TraySettingsTab extends PluginSettingTab {
   private badgePreview?: HTMLImageElement;
-
-  constructor(app: ObsidianApp, private plugin: RunInBackgroundPlugin) {
-    super(app, plugin);
-  }
+  private statusEl?: HTMLElement;
+  private retryButton?: HTMLButtonElement;
+  private syncControls: (() => void)[] = [];
+  private syncingControls = false;
+  private pendingRequests = 0;
+  private localError = "";
+  constructor(app: ObsidianApp, private plugin: RunInBackgroundPlugin) { super(app, plugin); }
 
   override getSettingDefinitions(): SettingDefinitionItem[] {
-    const isMac = process.platform === "darwin";
-    return [
-      {
-        name: "Enable Run in Background",
-        desc: "Master switch. Turn off all background, tray, launch-at-login, Dock/taskbar, close, and Quit behavior while keeping this settings page available.",
-        control: {
-          type: "toggle",
-          key: "pluginEnabled",
-        },
-      },
-      {
-        name: ABOUT_AND_FEEDBACK.heading,
-        render: (setting: Setting) => { setting.setName(ABOUT_AND_FEEDBACK.heading).setHeading(); },
-      },
-      {
-        name: ABOUT_AND_FEEDBACK.name,
-        desc: ABOUT_AND_FEEDBACK.description,
-        render: (setting: Setting) => this.aboutAndFeedback(setting),
-      },
-      {
-        type: "group",
-        heading: "Window management",
-        items: [
-          {
-            name: "Launch on startup",
-            desc: "Open Obsidian when you log in.",
-            control: {
-              type: "toggle",
-              key: "launchOnStartup",
-            },
-          },
-          {
-            name: "Hide on launch",
-            desc: "Choose whether the vault starts hidden. Login detection distinguishes an automatic device-login launch from opening Obsidian normally.",
-            control: {
-              type: "dropdown",
-              key: "hideOnLaunchMode",
-              options: {
-                always: "Always",
-                login: "Only when opened at login",
-                never: "Never",
-              },
-            },
-          },
-          {
-            name: "Run in background",
-            desc: "Hide an ordinary window close instead of closing the vault.",
-            control: {
-              type: "toggle",
-              key: "runInBackground",
-            },
-          },
-          {
-            name: "Keep running after Quit command",
-            desc: "Make Cmd+Q or the normal Quit command hide this vault. System shutdown still exits.",
-            control: {
-              type: "toggle",
-              key: "keepRunningAfterQuit",
-            },
-          },
-          {
-            name: isMac ? "Hide Dock icon" : "Hide taskbar icon",
-            desc: "Hide Obsidian from the Dock or taskbar. A tray icon will remain available.",
-            control: {
-              type: "toggle",
-              key: "hideTaskbarIcon",
-            },
-          },
-          {
-            name: "Create tray icon",
-            desc: "Create a tray or menu-bar icon.",
-            control: {
-              type: "toggle",
-              key: "createTrayIcon",
-            },
-          },
-          {
-            name: "Tray icon image",
-            desc: "Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.",
-            render: (setting: Setting) => {
-              this.renderTrayImageControl(setting);
-            },
-          },
-          {
-            name: "Vault badge",
-            desc: "Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.",
-            render: (setting: Setting) => {
-              this.renderVaultBadgeControl(setting);
-            },
-          },
-        ],
-      },
-    ];
+    const definitions = traySettingDefinitions(process.platform);
+    const entry = (definition: TraySettingDefinition) => {
+      if (definition.kind === "toggle") return { name: definition.name, desc: definition.desc, control: { type: "toggle" as const, key: definition.key } };
+      if (definition.kind === "dropdown") return { name: definition.name, desc: definition.desc, control: { type: "dropdown" as const, key: definition.key, options: { always: "Always", login: "Only when opened at login", never: "Never" } } };
+      return { name: definition.name, desc: definition.desc, render: (setting: Setting) => this.renderControl(setting, definition) };
+    };
+    return [entry(definitions[0]!), { name: ABOUT_AND_FEEDBACK.heading, render: (setting: Setting) => { setting.setName(ABOUT_AND_FEEDBACK.heading).setHeading(); } },
+      { name: ABOUT_AND_FEEDBACK.name, desc: ABOUT_AND_FEEDBACK.description, render: (setting: Setting) => this.aboutAndFeedback(setting) },
+      { name: "Update status", render: (setting: Setting) => this.renderStatus(setting) },
+      { type: "group", heading: "Window management", items: definitions.slice(1).map(entry) }];
   }
-
-  override getControlValue(key: string): unknown {
-    if (key in this.plugin.settings) {
-      return this.plugin.settings[key as keyof TraySettings];
-    }
-    return undefined;
-  }
-
-  override async setControlValue(key: string, value: unknown): Promise<void> {
-    if (key === "pluginEnabled") {
-      await this.plugin.setPluginEnabled(Boolean(value));
-      return;
-    }
-    if (key === "launchOnStartup") {
-      this.plugin.settings.launchOnStartup = Boolean(value);
-      await this.plugin.saveSettings();
-      await this.plugin.updateLogin();
-      return;
-    }
-    if (key === "hideOnLaunchMode") {
-      if (value === "always" || value === "login" || value === "never") {
-        this.plugin.settings.hideOnLaunchMode = value;
-        await this.plugin.saveSettings();
-        await this.plugin.updateLogin();
-      }
-      return;
-    }
-    if (key === "runInBackground") {
-      this.plugin.settings.runInBackground = Boolean(value);
-      await this.plugin.saveSettings();
-      this.plugin.updateBackgroundMode();
-      await this.plugin.updateLogin();
-      this.plugin.showWindows();
-      return;
-    }
-    if (key === "keepRunningAfterQuit") {
-      this.plugin.settings.keepRunningAfterQuit = Boolean(value);
-      await this.plugin.saveSettings();
-      return;
-    }
-    if (key === "hideTaskbarIcon") {
-      const val = Boolean(value);
-      this.plugin.settings.hideTaskbarIcon = val;
-      if (val) reconcileRecoveryPath(this.plugin.settings, "hideTaskbarIcon");
-      await this.plugin.saveSettings();
-      this.plugin.updateTaskbar();
-      await this.plugin.createTray();
-      return;
-    }
-    if (key === "createTrayIcon") {
-      const val = Boolean(value);
-      this.plugin.settings.createTrayIcon = val;
-      if (!val) reconcileRecoveryPath(this.plugin.settings, "createTrayIcon");
-      await this.plugin.saveSettings();
-      this.plugin.updateTaskbar();
-      await this.plugin.createTray();
-      return;
-    }
-  }
-
+  override getControlValue(key: string): unknown { return key in this.plugin.settings ? this.plugin.getDesiredSetting(key as keyof TraySettings) : undefined; }
+  override async setControlValue(key: string, value: unknown): Promise<void> { if (key in this.plugin.settings) { try { await this.plugin.requestSetting(key as keyof TraySettings, value); } catch { /* The pipeline exposes the failure and retry request. */ } finally { this.refreshStatus(); } } }
   override display(): void {
-    this.containerEl.empty();
-    this.masterSwitch();
-    new Setting(this.containerEl).setName(ABOUT_AND_FEEDBACK.heading).setHeading();
-    this.aboutAndFeedback(new Setting(this.containerEl));
+    this.containerEl.empty(); this.syncControls = [];
+    const definitions = traySettingDefinitions(process.platform);
+    this.renderControl(new Setting(this.containerEl), definitions[0]!);
+    new Setting(this.containerEl).setName(ABOUT_AND_FEEDBACK.heading).setHeading(); this.aboutAndFeedback(new Setting(this.containerEl));
+    this.renderStatus(new Setting(this.containerEl));
     new Setting(this.containerEl).setName("Window management").setHeading();
-    this.toggle("Launch on startup", "Open Obsidian when you log in.", "launchOnStartup", undefined, () => this.plugin.updateLogin());
-    new Setting(this.containerEl)
-      .setName("Hide on launch")
-      .setDesc("Choose whether the vault starts hidden. Login detection distinguishes an automatic device-login launch from opening Obsidian normally.")
-      .addDropdown((control) => control
-        .addOption("always", "Always")
-        .addOption("login", "Only when opened at login")
-        .addOption("never", "Never")
-        .setValue(this.plugin.settings.hideOnLaunchMode)
-        .onChange((value) => {
-          if (value !== "always" && value !== "login" && value !== "never") return;
-          this.plugin.settings.hideOnLaunchMode = value;
-          void this.commit(() => this.plugin.updateLogin());
-        }));
-    this.toggle("Run in background", "Hide an ordinary window close instead of closing the vault.", "runInBackground", undefined, () => {
-      this.plugin.updateBackgroundMode();
-      this.plugin.showWindows();
-      return this.plugin.updateLogin();
-    });
-    this.toggle("Keep running after Quit command", "Make Cmd+Q or the normal Quit command hide this vault. System shutdown still exits.", "keepRunningAfterQuit");
-    const taskbarName = process.platform === "darwin" ? "Hide Dock icon" : "Hide taskbar icon";
-    this.toggle(taskbarName, "Hide Obsidian from the Dock or taskbar. A tray icon will remain available.", "hideTaskbarIcon", (value) => {
-      if (value) reconcileRecoveryPath(this.plugin.settings, "hideTaskbarIcon");
-    }, async () => {
-      this.plugin.updateTaskbar();
-      await this.plugin.createTray();
-      this.display();
-    });
-    this.toggle("Create tray icon", "Create a tray or menu-bar icon.", "createTrayIcon", (value) => {
-      if (!value) reconcileRecoveryPath(this.plugin.settings, "createTrayIcon");
-    }, async () => {
-      this.plugin.updateTaskbar();
-      await this.plugin.createTray();
-      this.display();
-    });
-    const imageSetting = new Setting(this.containerEl)
-      .setName("Tray icon image")
-      .setDesc("Choose a preset or upload a square PNG/SVG. 64×64 px is ideal; 32×32 px is the practical minimum.");
-    this.renderTrayImageControl(imageSetting);
-
-    const badgeSetting = new Setting(this.containerEl)
-      .setName("Vault badge")
-      .setDesc("Up to three letters, numbers, emoji, or symbols, optionally separated by spaces. Leave blank for no badge.");
-    this.renderVaultBadgeControl(badgeSetting);
+    for (const definition of definitions.slice(1)) this.renderControl(new Setting(this.containerEl), definition);
   }
-
+  private change(key: keyof TraySettings, value: unknown): void { if (!this.syncingControls) this.commit(() => this.plugin.requestSetting(key, value)); }
+  private commit(action: () => Promise<void>): void {
+    this.pendingRequests++; this.localError = ""; this.refreshStatus();
+    void Promise.resolve().then(action).then(() => { this.updatePreview(this.plugin.getSettingsState().preview); }).catch((error: unknown) => { this.localError = error && typeof error === "object" && "message" in error && typeof error.message === "string" ? error.message : "The update failed. Retry the request."; }).finally(() => { this.pendingRequests--; this.refreshStatus(); });
+  }
+  private renderControl(setting: Setting, definition: TraySettingDefinition): void {
+    setting.setName(definition.name).setDesc(definition.desc);
+    if (definition.kind === "toggle") setting.addToggle(control => {
+      const sync = (): void => { control.setValue(Boolean(this.plugin.getDesiredSetting(definition.key))); }; sync(); this.syncControls.push(sync);
+      control.onChange(value => this.change(definition.key, value));
+    });
+    else if (definition.kind === "dropdown") setting.addDropdown(control => {
+      control.addOption("always", "Always").addOption("login", "Only when opened at login").addOption("never", "Never");
+      const sync = (): void => { control.setValue(String(this.plugin.getDesiredSetting(definition.key))); }; sync(); this.syncControls.push(sync);
+      control.onChange(value => this.change(definition.key, value));
+    });
+    else if (definition.kind === "icon") this.renderTrayImageControl(setting);
+    else this.renderVaultBadgeControl(setting);
+  }
+  private renderStatus(setting: Setting): void {
+    setting.setName("Update status"); this.statusEl = setting.descEl; this.statusEl.setAttribute("role", "status"); this.statusEl.setAttribute("aria-live", "polite");
+    setting.addButton(button => { this.retryButton = button.buttonEl; button.setButtonText("Retry").onClick(() => { this.commit(() => this.plugin.retrySettings()); }); });
+    this.refreshStatus();
+  }
+  refreshStatus(): void {
+    const state = this.plugin.getSettingsState(), pending = state.pending || this.pendingRequests > 0, error = this.localError || state.error;
+    if (this.statusEl) this.statusEl.textContent = pending ? "Saving and applying changes…" : error || `Settings saved. Recovery tray: ${state.recovery ? "available" : "unavailable; Dock/taskbar stays visible"}.`;
+    if (this.retryButton) { this.retryButton.hidden = !error; this.retryButton.style.setProperty("display", error ? "" : "none", "important"); this.retryButton.disabled = pending; }
+    this.syncingControls = true;
+    try { for (const sync of this.syncControls) sync(); } finally { this.syncingControls = false; }
+  }
   private aboutAndFeedback(setting: Setting): void {
     setting
       .setName(ABOUT_AND_FEEDBACK.name)
@@ -811,128 +755,46 @@ class TraySettingsTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText(ABOUT_AND_FEEDBACK.bugReportLabel).onClick(() => openExternalLink(BUG_REPORT_URL)));
   }
 
-  private masterSwitch(): void {
-    const setting = new Setting(this.containerEl)
-      .setName("Enable Run in Background")
-      .setDesc("Master switch. Turn off all background, tray, launch-at-login, Dock/taskbar, close, and Quit behavior while keeping this settings page available.")
-      .addToggle((control) => control
-        .setValue(this.plugin.settings.pluginEnabled)
-        .onChange((value) => void this.plugin.setPluginEnabled(value)));
-    setting.settingEl.addClass("run-in-background-master-switch");
-  }
-
   private renderTrayImageControl(setting: Setting): void {
-    setting.controlEl.empty();
-    setting.controlEl.setCssStyles({ gap: "8px" });
-    const presetButtons: HTMLButtonElement[] = [];
-    const selectedPreset = (): string | undefined =>
-      TRAY_ICON_PRESETS.find((preset) => preset.dataUrl === this.plugin.settings.trayIconImage)?.id;
-    const refreshSelection = (): void => {
-      const selected = selectedPreset();
-      for (const button of presetButtons) {
-        const active = button.dataset.preset === selected;
-        button.classList.toggle("mod-cta", active);
-        button.setAttribute("aria-pressed", String(active));
-        button.setCssStyles({ boxShadow: active ? "0 0 0 2px var(--interactive-accent)" : "none" });
-      }
-    };
+    setting.controlEl.setCssStyles({ gap: "8px", flexWrap: "wrap" });
+    const buttons: HTMLButtonElement[] = [];
     for (const preset of TRAY_ICON_PRESETS) {
-      const button = setting.controlEl.createEl("button", { cls: "clickable-icon", attr: { "aria-label": preset.name, title: preset.name } });
-      button.dataset.preset = preset.id;
-      button.setCssStyles({ width: "40px", height: "40px", borderRadius: "8px" });
-      const image = button.createEl("img", { attr: { src: preset.dataUrl, alt: preset.name } });
-      image.setCssStyles({ width: "30px", height: "30px", objectFit: "contain" });
-      presetButtons.push(button);
-      button.addEventListener("click", () => {
-        this.plugin.settings.trayIconImage = preset.dataUrl;
-        customPreview.setCssStyles({ display: "none" });
-        refreshSelection();
-        void this.commit(() => this.plugin.createTray());
-      });
+      const button = setting.controlEl.createEl("button", { cls: "clickable-icon", attr: { "aria-label": preset.name, title: preset.name } }); buttons.push(button);
+      button.dataset.preset = preset.id; button.setCssStyles({ width: "40px", height: "40px", minWidth: "40px", minHeight: "40px", flexShrink: "0", padding: "4px", borderRadius: "8px" });
+      button.createEl("img", { attr: { src: preset.dataUrl, alt: "" } }).setCssStyles({ width: "30px", height: "30px", objectFit: "contain" });
+      button.addEventListener("click", () => this.change("trayIconImage", preset.dataUrl));
     }
-    const customPreview = setting.controlEl.createEl("img", {
-      attr: { src: selectedPreset() ? "" : this.plugin.settings.trayIconImage, alt: "Uploaded custom icon" },
-    });
-    this.stylePreview(customPreview);
-    customPreview.setCssStyles({ display: selectedPreset() ? "none" : "block" });
-    setting.addButton((button) => button.setButtonText("Upload your own").onClick(() => {
-      const input = createEl("input", { attr: { type: "file", accept: "image/*" } });
+    const preview = setting.controlEl.createEl("img", { attr: { alt: "Uploaded custom icon" } }); this.stylePreview(preview);
+    const sync = (): void => {
+      const source = String(this.plugin.getDesiredSetting("trayIconImage")); const selected = TRAY_ICON_PRESETS.find(preset => preset.dataUrl === source)?.id;
+      for (const button of buttons) { const active = button.dataset.preset === selected; button.classList.toggle("mod-cta", active); button.setAttribute("aria-pressed", String(active)); }
+      preview.hidden = Boolean(selected); if (!selected) preview.src = source;
+    }; sync(); this.syncControls.push(sync);
+    setting.addButton(button => button.setButtonText("Upload your own").onClick(() => {
+      const input = createEl("input", { attr: { type: "file", accept: "image/png,image/svg+xml,.png,.svg" } });
       input.onchange = () => {
-        const file = input.files?.[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          if (typeof reader.result !== "string") return;
-          this.plugin.settings.trayIconImage = reader.result;
-          customPreview.src = reader.result;
-          customPreview.setCssStyles({ display: "block" });
-          refreshSelection();
-          void this.commit(async () => {
-            await this.plugin.createTray();
-          });
-        };
+        const file = input.files?.[0]; if (!file) return;
+        const revision = this.plugin.beginIconInput();
+        if (file.size > MAX_ICON_BYTES || !/\.(png|svg)$/iu.test(file.name)) { this.plugin.reportError(new Error("Choose a PNG/SVG file up to 256 KiB.")); return; }
+        const reader = new FileReader(); reader.onerror = () => this.plugin.reportError(new Error("The image could not be read."));
+        reader.onload = () => { const source = reader.result; if (typeof source === "string") this.commit(() => this.plugin.setTrayImage(source, revision)); };
         reader.readAsDataURL(file);
-      };
-      input.click();
+      }; input.click();
     }));
-    refreshSelection();
   }
-
   private renderVaultBadgeControl(setting: Setting): void {
-    setting.controlEl.empty();
-    this.badgePreview = setting.controlEl.createEl("img", {
-      attr: { src: this.plugin.trayPreviewDataUrl, alt: "Tray icon with vault badge" },
-    });
-    this.stylePreview(this.badgePreview, 64);
-    setting
-      .addText((control) => {
-        control.setPlaceholder("G B C").setValue(this.plugin.settings.vaultBadge).onChange((value) => {
-          const normalized = normalizeVaultBadge(value);
-          control.setValue(normalized);
-          this.plugin.settings.vaultBadge = normalized;
-          void this.commit(() => this.plugin.createTray());
-        });
-      })
-      .addColorPicker((control) => control
-        .setValue(this.plugin.settings.badgeBackgroundColor)
-        .onChange((value) => {
-          this.plugin.settings.badgeBackgroundColor = value;
-          void this.commit(() => this.plugin.createTray());
-        }));
-  }
-
-  updatePreview(dataUrl: string): void {
-    if (this.badgePreview) this.badgePreview.src = dataUrl;
-  }
-
-  private stylePreview(preview: HTMLImageElement, size = 32): void {
-    preview.setCssStyles({
-      width: `${size}px`,
-      height: `${size}px`,
-      objectFit: "contain",
-      imageRendering: "auto",
+    this.badgePreview = setting.controlEl.createEl("img", { attr: { src: this.plugin.trayPreviewDataUrl, alt: "Tray icon with vault badge" } }); this.stylePreview(this.badgePreview, 64);
+    setting.addText(control => {
+      control.setPlaceholder("G B C").setValue(String(this.plugin.getDesiredSetting("vaultBadge")));
+      this.syncControls.push(() => { const value = String(this.plugin.getDesiredSetting("vaultBadge")); if (control.getValue() !== value) control.setValue(value); });
+      control.onChange(value => { const normalized = normalizeVaultBadge(value); if (value !== normalized) { const caret = control.inputEl.selectionStart; control.setValue(normalized); if (caret !== null) control.inputEl.setSelectionRange(Math.min(caret, normalized.length), Math.min(caret, normalized.length)); } this.change("vaultBadge", normalized); });
+    }).addColorPicker(control => {
+      control.setValue(String(this.plugin.getDesiredSetting("badgeBackgroundColor"))).onChange(value => this.change("badgeBackgroundColor", value));
+      this.syncControls.push(() => { control.setValue(String(this.plugin.getDesiredSetting("badgeBackgroundColor"))); });
     });
   }
-
-  private toggle(
-    name: string,
-    description: string,
-    key: keyof TraySettings,
-    beforeSave?: (value: boolean) => void,
-    after?: () => void | Promise<void>,
-  ): void {
-    new Setting(this.containerEl).setName(name).setDesc(description).addToggle((control) =>
-      control.setValue(Boolean(this.plugin.settings[key])).onChange((value) => {
-        (this.plugin.settings[key] as boolean) = value;
-        beforeSave?.(value);
-        void this.commit(after);
-      }));
-  }
-
-  private async commit(after?: () => void | Promise<void>): Promise<void> {
-    await this.plugin.saveSettings();
-    await after?.();
-  }
+  updatePreview(dataUrl: string): void { if (this.badgePreview) this.badgePreview.src = dataUrl; }
+  private stylePreview(preview: HTMLImageElement, size = 32): void { preview.setCssStyles({ width: `${size}px`, height: `${size}px`, objectFit: "contain", imageRendering: "auto" }); }
 }
 
 function openExternalLink(url: string): void {

@@ -1,4 +1,4 @@
-import { TRAY_ICON_PRESETS } from "./icon";
+import { isLocalIconSource, TRAY_ICON_PRESETS } from "./icon";
 
 const LEGACY_OBSIDIAN_ICON_PREFIX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9h";
 const LEGACY_REDRAWN_OBSIDIAN_MARKER = "%3ClinearGradient%20id%3D%22o%22";
@@ -23,7 +23,7 @@ export function shouldHideOnLaunch(mode: HideOnLaunchMode, wasOpenedAtLogin: boo
 }
 
 export function normalizeVaultBadge(value: string): string {
-  const segments = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value.trim())]
+  const segments = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value.trim().toLocaleUpperCase())]
     .map(({ segment }) => segment);
   const normalized: string[] = [];
   let visibleCharacters = 0;
@@ -35,7 +35,7 @@ export function normalizeVaultBadge(value: string): string {
     }
     if (visibleCharacters >= 3) break;
     if (pendingSpace) normalized.push(" ");
-    normalized.push(segment.toLocaleUpperCase());
+    normalized.push(segment);
     visibleCharacters += 1;
     pendingSpace = false;
   }
@@ -49,8 +49,8 @@ export function normalizeBadgeColor(value: string): string {
 export function deriveVaultBadge(vaultName: string): string {
   const words = vaultName.trim().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
   if (words.length === 0) return "V";
-  if (words.length === 1) return normalizeVaultBadge(words[0]!.slice(0, 1)) || "V";
-  return normalizeVaultBadge(words.slice(0, 2).map((word) => word[0]!).join("")) || "V";
+  if (words.length === 1) return normalizeVaultBadge([...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(words[0]!)][0]?.segment ?? "") || "V";
+  return normalizeVaultBadge(words.slice(0, 2).map((word) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(word)][0]?.segment ?? "").join("")) || "V";
 }
 
 export function defaultSettings(vaultName: string): TraySettings {
@@ -101,7 +101,7 @@ export function migrateSettings(input: unknown, vaultName: string): TraySettings
     trayIconImage: storedTrayIcon.startsWith(LEGACY_OBSIDIAN_ICON_PREFIX)
       || storedTrayIcon.includes(LEGACY_REDRAWN_OBSIDIAN_MARKER)
       ? TRAY_ICON_PRESETS[0].dataUrl
-      : storedTrayIcon,
+      : isLocalIconSource(storedTrayIcon) ? storedTrayIcon : TRAY_ICON_PRESETS[0].dataUrl,
     vaultBadge: typeof source.vaultBadge === "string" ? normalizeVaultBadge(source.vaultBadge) : defaults.vaultBadge,
     badgeBackgroundColor: typeof source.badgeBackgroundColor === "string"
       ? normalizeBadgeColor(source.badgeBackgroundColor)

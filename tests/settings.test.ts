@@ -1,3 +1,4 @@
+import { TRAY_ICON_PRESETS } from "../src/icon";
 import { describe, expect, it } from "vitest";
 import { defaultSettings, deriveVaultBadge, migrateSettings, normalizeBadgeColor, normalizeVaultBadge, reconcileRecoveryPath, shouldHideOnLaunch } from "../src/settings";
 
@@ -57,8 +58,8 @@ describe("settings migration", () => {
   });
 
   it("preserves compatible icon and window settings", () => {
-    const migrated = migrateSettings({ trayIconImage: "data:image/png;base64,abc", hideTaskbarIcon: true }, "Gabriel");
-    expect(migrated.trayIconImage).toBe("data:image/png;base64,abc");
+    const migrated = migrateSettings({ trayIconImage: "data:image/png;base64,iVBORw0KGgo=", hideTaskbarIcon: true }, "Gabriel");
+    expect(migrated.trayIconImage).toBe("data:image/png;base64,iVBORw0KGgo=");
     expect(migrated.hideTaskbarIcon).toBe(true);
     expect(migrated.createTrayIcon).toBe(true);
   });
@@ -127,4 +128,13 @@ describe("hide on launch", () => {
   it("never hides in never mode", () => {
     expect(shouldHideOnLaunch("never", true)).toBe(false);
   });
+});
+
+it("limits expanding uppercase characters after conversion and keeps non-BMP initials intact", () => {
+  expect(normalizeVaultBadge("ßßß")).toBe("SSS");
+  expect(deriveVaultBadge("𐐨lpha 𐐩eta")).toBe("𐐀𐐁");
+});
+it("rejects remote and oversized stored images", () => {
+  expect(migrateSettings({ trayIconImage: "https://example.test/icon.png" }, "Vault").trayIconImage).toBe(TRAY_ICON_PRESETS[0].dataUrl);
+  expect(migrateSettings({ trayIconImage: "data:image/svg+xml," + "x".repeat(600000) }, "Vault").trayIconImage).toBe(TRAY_ICON_PRESETS[0].dataUrl);
 });

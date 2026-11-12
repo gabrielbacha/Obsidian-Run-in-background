@@ -99,6 +99,8 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     owned: Set<ReadonlyMap<object, unknown>>;
     quits: WeakMap<object, QuitScope>;
     closedUnowned: WeakSet<object>;
+    focus?: Map<GuardWindow, { original: GuardWindow["focus"]; owned: boolean; wrapped: GuardWindow["focus"]; listeners: Map<object, { enabled(): boolean; reveal(): void }> }>;
+    relaunch?: { original: GuardApp["relaunch"]; owned: boolean; wrapped: GuardApp["relaunch"]; listeners: Set<() => void> };
   } | undefined>;
   const registry = shared[registryKey] ??= { owned: new Set(), quits: new WeakMap(), closedUnowned: new WeakSet() };
   registry.owned.add(windows);
@@ -116,7 +118,18 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     window.hide();
   };
 
+  const releaseFocusHook = (window: GuardWindow): void => {
+    focusHooks.delete(window);
+    const hook = registry.focus?.get(window);
+    hook?.listeners.delete(windows);
+    if (!hook || hook.listeners.size > 0) return;
+    registry.focus?.delete(window);
+    if (window.focus !== hook.wrapped) return;
+    if (hook.owned) window.focus = hook.original;
+    else delete (window as Partial<GuardWindow>).focus;
+  };
   const untrack = (window: GuardWindow): void => {
+    releaseFocusHook(window);
     const listeners = windows.get(window);
     if (!listeners) return;
     windows.delete(window);
@@ -146,30 +159,28 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
 
   const revealOnFocus = (window: GuardWindow, onReveal: () => void): void => {
     if (disposed || focusHooks.has(window)) return;
-    const owned = Object.prototype.hasOwnProperty.call(window, "focus");
-    const original = window.focus;
-    const wrapped = function (this: unknown, ...args: unknown[]): void {
-      if (!allowsEverything() && !window.isDestroyed() && !window.isVisible()) {
-        window.show();
-        record("focus request showed the hidden vault");
-        try {
-          onReveal();
-        } catch {
-          // The renderer is gone; the window is shown already.
+    registry.focus ??= new Map();
+    let hook = registry.focus.get(window);
+    if (!hook) {
+      const original = window.focus;
+      const listeners = new Map<object, { enabled(): boolean; reveal(): void }>();
+      const wrapped = ((target: GuardWindow, active: Map<object, { enabled(): boolean; reveal(): void }>, forward: GuardWindow["focus"]) => function (this: unknown, ...args: unknown[]): void {
+        const enabled = [...active.values()].filter((listener) => listener.enabled());
+        if (enabled.length && !target.isDestroyed() && !target.isVisible()) {
+          target.show();
+          for (const listener of enabled) { try { listener.reveal(); } catch { /* The window is already visible. */ } }
         }
-      }
-      original.apply(this, args);
-    };
-    window.focus = wrapped;
-    focusHooks.set(window, { wrapped, original, owned });
+        forward.apply(this, args);
+      })(window, listeners, original);
+      hook = { original, owned: Object.prototype.hasOwnProperty.call(window, "focus"), wrapped, listeners };
+      registry.focus.set(window, hook);
+      window.focus = wrapped;
+    }
+    hook.listeners.set(windows, { enabled: () => !allowsEverything(), reveal: () => { record("focus request showed the hidden vault"); onReveal(); } });
+    focusHooks.set(window, { wrapped: hook.wrapped, original: hook.original, owned: hook.owned });
   };
   const releaseFocusHooks = (): void => {
-    for (const [window, hook] of focusHooks) {
-      if (window.focus !== hook.wrapped) continue;
-      if (hook.owned) window.focus = hook.original;
-      else delete (window as Partial<GuardWindow>).focus;
-    }
-    focusHooks.clear();
+    for (const window of [...focusHooks.keys()]) releaseFocusHook(window);
   };
 
   const stop = (): void => {
@@ -258,16 +269,18 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     record("update install: quit allowed");
   };
 
-  const ownsRelaunch = Object.prototype.hasOwnProperty.call(app, "relaunch");
-  const relaunch = app.relaunch;
-  const wrappedRelaunch = function (this: unknown, ...args: unknown[]): void {
-    if (!disposed) {
-      relaunching = true;
-      record("relaunch: quit allowed");
-    }
-    relaunch.apply(this, args);
-  };
-  app.relaunch = wrappedRelaunch;
+  if (!registry.relaunch) {
+    const original = app.relaunch;
+    const listeners = new Set<() => void>();
+    const wrapped = ((active: Set<() => void>, forward: GuardApp["relaunch"]) => function (this: unknown, ...args: unknown[]): void {
+      for (const listener of [...active]) listener();
+      forward.apply(this, args);
+    })(listeners, original);
+    registry.relaunch = { original, owned: Object.prototype.hasOwnProperty.call(app, "relaunch"), wrapped, listeners };
+    app.relaunch = wrapped;
+  }
+  const relaunchListener = (): void => { relaunching = true; record("relaunch: quit allowed"); };
+  registry.relaunch.listeners.add(relaunchListener);
 
   const dispose = (): void => {
     if (disposed) return;
@@ -280,10 +293,14 @@ export function installCloseGuard(host: CloseGuardHost, initial: CloseGuardOptio
     autoUpdater?.removeListener("before-quit-for-update", beforeUpdate);
     owner.removeListener("destroyed", dispose);
     owner.removeListener("render-process-gone", dispose);
-    // Another guard may have wrapped this one; a disposed wrapper only forwards the call.
-    if (app.relaunch === wrappedRelaunch) {
-      if (ownsRelaunch) app.relaunch = relaunch;
-      else delete (app as Partial<GuardApp>).relaunch;
+    const wrapper = registry.relaunch;
+    wrapper?.listeners.delete(relaunchListener);
+    if (wrapper && wrapper.listeners.size === 0) {
+      if (app.relaunch === wrapper.wrapped) {
+        if (wrapper.owned) app.relaunch = wrapper.original;
+        else delete (app as Partial<GuardApp>).relaunch;
+      }
+      registry.relaunch = undefined;
     }
   };
 

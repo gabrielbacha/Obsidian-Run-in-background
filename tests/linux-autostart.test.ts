@@ -70,8 +70,8 @@ describe("Linux autostart coordination", () => {
     expect(await readdir(autostartDirectory)).toEqual(["run-in-background-obsidian.desktop"]);
     const contents = await readFile(join(autostartDirectory, "run-in-background-obsidian.desktop"), "utf8");
     expect(contents).toContain("/vault/G&A Workdesk");
-    expect(second.startupCommands(activeVaults, "G&A Workdesk")).toEqual([
-      ["/bin/sh", "obsidian://open?vault=GB-AI-Context", LOGIN_MARKER],
+    expect(second.startupCommands(activeVaults, "/vault/G&A Workdesk")).toEqual([
+      ["/bin/sh", "/vault/GB-AI-Context", LOGIN_MARKER],
     ]);
     await first.setEnabled(false);
     expect(await readFile(join(autostartDirectory, "run-in-background-obsidian.desktop"), "utf8"))
@@ -98,8 +98,8 @@ describe("Linux autostart coordination", () => {
     const first = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home, vaultExists });
     const second = new LinuxAutostartManager("/vault/two", "Two", { env, executable: "/bin/sh", home, vaultExists });
     await first.setEnabled(true);
-    expect(await first.claimStartupBootstrap()).toBe(true);
-    expect(await second.claimStartupBootstrap()).toBe(false);
+    expect(await first.claimStartupBootstrap({ pid: process.pid, sessionId: "test-session", loginLaunch: true })).toBe(true);
+    expect(await second.claimStartupBootstrap({ pid: process.pid, sessionId: "test-session", loginLaunch: true })).toBe(false);
   });
 
   it("removes bootstrap claims left by an earlier Obsidian process", async () => {
@@ -109,7 +109,7 @@ describe("Linux autostart coordination", () => {
     await manager.setEnabled(true);
     const markerDirectory = join(env.XDG_CONFIG_HOME, "run-in-background", "autostart-vaults");
     await writeFile(join(markerDirectory, "startup-session-999999"), "");
-    expect(await manager.claimStartupBootstrap()).toBe(true);
+    expect(await manager.claimStartupBootstrap({ pid: process.pid, sessionId: "test-session", loginLaunch: true })).toBe(true);
     expect((await readdir(markerDirectory)).some((file) => file === "startup-session-999999")).toBe(false);
   });
 
@@ -195,4 +195,34 @@ describe("Linux autostart coordination", () => {
     expect(contents).toContain(live);
     expect(contents).not.toContain("A-Deleted");
   });
+});
+
+it("preserves an enabled registration and legacy launcher through failed refresh/disable", async () => {
+  const home = await temporaryHome(), env = { FLATPAK_ID: "md.obsidian.Obsidian" }; let accepted = true;
+  const manager = new LinuxAutostartManager("/vault/one", "One", { env, executable: "/bin/sh", home, vaultExists, requestPortal: () => Promise.resolve(accepted) });
+  await manager.setEnabled(true);
+  const legacy = join(home, ".config/autostart/run-in-background-obsidian-0123456789abcdef0123.desktop"), body = createDesktopEntry(["/bin/sh", "/vault/one", LOGIN_MARKER]);
+  await mkdir(join(home, ".config/autostart"), { recursive: true }); await writeFile(legacy, body); accepted = false;
+  await expect(manager.setEnabled(true)).rejects.toBeInstanceOf(PortalPermissionDeniedError); expect(await readFile(legacy, "utf8")).toBe(body);
+  await expect(manager.setEnabled(false)).rejects.toBeInstanceOf(PortalPermissionDeniedError); expect(await readFile(legacy, "utf8")).toBe(body);
+  accepted = true; expect(await manager.setEnabled(true)).toHaveLength(1);
+});
+it("routes same-named vaults by exact paths and cannot take a live owner's claim", async () => {
+  const home = await temporaryHome(), options = { env: {}, executable: "/bin/sh", home, vaultExists, processAlive: (pid: number) => pid === 111 || pid === 222 };
+  const a = new LinuxAutostartManager("/a/Same", "Same", options), b = new LinuxAutostartManager("/b/Same", "Same", options);
+  await a.setEnabled(true); const records = await b.setEnabled(true);
+  expect(a.startupCommands(records, "/a/Same")).toEqual([["/bin/sh", "/b/Same", LOGIN_MARKER]]);
+  expect(await a.claimStartupBootstrap({ pid: 111, sessionId: "session-a", loginLaunch: false })).toBe(false);
+  expect(await a.claimStartupBootstrap({ pid: 111, sessionId: "session-a", loginLaunch: true })).toBe(true);
+  expect(await b.claimStartupBootstrap({ pid: 222, sessionId: "session-b", loginLaunch: true })).toBe(false);
+});
+it("restores migrated legacy files and OS state if cleanup fails after portal success", async () => {
+  const home = await temporaryHome(), directory = join(home, ".config/autostart"), body = createDesktopEntry(["/bin/sh", "/vault/one", LOGIN_MARKER]);
+  await mkdir(directory, { recursive: true });
+  const paths = ["0123456789abcdef0123", "123456789abcdef01234"].map(id => join(directory, `run-in-background-obsidian-${id}.desktop`));
+  await Promise.all(paths.map(path => writeFile(path, body))); const requests: boolean[] = []; let removals = 0;
+  const manager = new LinuxAutostartManager("/vault/one", "One", { env: { FLATPAK_ID: "md.obsidian.Obsidian" }, executable: "/bin/sh", home, vaultExists,
+    requestPortal: enabled => { requests.push(enabled); return Promise.resolve(true); }, removeLegacyEntry: async path => { if (++removals === 2) throw new Error("Legacy cleanup failed"); await rm(path); } });
+  await expect(manager.setEnabled(true)).rejects.toThrow("Legacy cleanup failed"); expect(requests).toEqual([true, false]);
+  for (const path of paths) expect(await readFile(path, "utf8")).toBe(body);
 });

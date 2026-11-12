@@ -32,20 +32,75 @@ export interface ComposedTrayIcon {
   pixmaps: ReadonlyArray<{ width: number; height: number; data: Uint8Array }>;
 }
 
+export const MAX_ICON_BYTES = 256 * 1024;
+export const MAX_ICON_DIMENSION = 2048;
+export const NORMALIZED_ICON_SIZE = 64;
+const images = new Map<string, Promise<HTMLImageElement>>();
+const compositions = new Map<string, ComposedTrayIcon>();
+
+export function validateIconSource(source: string): void {
+  if (source.length > MAX_ICON_BYTES * 2) throw new Error("Tray icon must be a PNG or SVG no larger than 256 KiB.");
+  const match = source.match(/^data:image\/(png|svg\+xml)(;base64)?,(.*)$/su);
+  if (!match) throw new Error("Tray icons must be local PNG or SVG image data.");
+  let content: string;
+  try { content = match[2] ? atob(match[3]!) : decodeURIComponent(match[3]!); }
+  catch { throw new Error("Tray image data is invalid."); }
+  if ((match[2] ? content.length : new TextEncoder().encode(content).byteLength) > MAX_ICON_BYTES) throw new Error("Tray icon exceeds 256 KiB.");
+  if (match[1] === "png") {
+    if (!match[2] || !content.startsWith("\x89PNG\r\n\x1a\n")) throw new Error("Invalid PNG image.");
+    return;
+  }
+  if (/<!DOCTYPE|<!ENTITY|<(?:script|foreignObject|iframe|image|style|animate|animateMotion|animateTransform|set)\b|@import|(?:href|src)\s*=\s*["'](?!#)|url\(\s*["']?(?!#)/iu.test(content)) throw new Error("SVG icons cannot load external content or execute code.");
+  if (typeof DOMParser !== "undefined") {
+    const document = new DOMParser().parseFromString(content, "image/svg+xml");
+    if (document.querySelector("parsererror") || document.documentElement.localName !== "svg") throw new Error("Invalid SVG image.");
+    for (const element of Array.from(document.querySelectorAll("*"))) for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.toLowerCase().startsWith("on") || ((attribute.localName === "href" || attribute.localName === "src") && !attribute.value.startsWith("#")) || /url\(\s*["']?(?!#)|@import/iu.test(attribute.value)) throw new Error("SVG icons cannot load external content or execute code.");
+    }
+  } else if (!/^\s*<svg\b/iu.test(content)) throw new Error("Invalid SVG image.");
+}
+
+export function isLocalIconSource(source: string): boolean {
+  try { validateIconSource(source); return true; } catch { return false; }
+}
+
 function loadImage(dataUrl: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
+  validateIconSource(dataUrl);
+  const cached = images.get(dataUrl);
+  if (cached) return cached;
+  const loaded = new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("Unable to load tray icon image"));
+    const timer = setTimeout(() => { image.onload = null; image.onerror = null; reject(new Error("Tray icon decoding timed out.")); }, 5000);
+    image.onload = () => {
+      clearTimeout(timer); image.onload = null; image.onerror = null;
+      if (!image.naturalWidth || !image.naturalHeight || image.naturalWidth > MAX_ICON_DIMENSION || image.naturalHeight > MAX_ICON_DIMENSION) return reject(new Error("Tray image dimensions must be no larger than 2048×2048."));
+      resolve(image);
+    };
+    image.onerror = () => { clearTimeout(timer); image.onload = null; image.onerror = null; reject(new Error("Unable to load tray icon image")); };
     image.src = dataUrl;
   });
+  images.set(dataUrl, loaded);
+  if (images.size > 4) images.delete(images.keys().next().value!);
+  void loaded.catch(() => { images.delete(dataUrl); });
+  return loaded;
+}
+
+export async function normalizeCustomIcon(source: string): Promise<string> {
+  const image = await loadImage(source);
+  const canvas = createEl("canvas"); canvas.width = NORMALIZED_ICON_SIZE; canvas.height = NORMALIZED_ICON_SIZE;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas is unavailable");
+  const ratio = Math.min(NORMALIZED_ICON_SIZE / image.naturalWidth, NORMALIZED_ICON_SIZE / image.naturalHeight);
+  const width = image.naturalWidth * ratio, height = image.naturalHeight * ratio;
+  context.drawImage(image, (NORMALIZED_ICON_SIZE - width) / 2, (NORMALIZED_ICON_SIZE - height) / 2, width, height);
+  const normalized = canvas.toDataURL("image/png");
+  if (normalized.length > 64 * 1024) throw new Error("Normalized tray icon exceeds the saved size limit.");
+  return normalized;
 }
 
 export function badgeTextColor(background: string): "#000000" | "#ffffff" {
-  const red = Number.parseInt(background.slice(1, 3), 16);
-  const green = Number.parseInt(background.slice(3, 5), 16);
-  const blue = Number.parseInt(background.slice(5, 7), 16);
-  return (red * 299 + green * 587 + blue * 114) / 1000 >= 150 ? "#000000" : "#ffffff";
+  const luminance = [1, 3, 5].map((offset) => Number.parseInt(background.slice(offset, offset + 2), 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index]!, 0);
+  return (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) ? "#000000" : "#ffffff";
 }
 
 function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgroundColor: string, pixelSize: number): {
@@ -96,14 +151,20 @@ function drawRepresentation(image: HTMLImageElement, badge: string, badgeBackgro
 }
 
 export async function composeTrayIcon(sourceDataUrl: string, badge: string, badgeBackgroundColor: string): Promise<ComposedTrayIcon> {
+  const key = JSON.stringify([sourceDataUrl, badge, badgeBackgroundColor]);
+  const cached = compositions.get(key);
+  if (cached) return cached;
   const image = await loadImage(sourceDataUrl);
   const rendered = TRAY_REPRESENTATIONS.map(({ pixelSize, scaleFactor }) => ({
     scaleFactor,
     ...drawRepresentation(image, badge, badgeBackgroundColor, pixelSize),
   }));
-  return {
+  const composed: ComposedTrayIcon = {
     previewDataUrl: drawRepresentation(image, badge, badgeBackgroundColor, TRAY_PREVIEW_PIXEL_SIZE).dataURL,
     representations: rendered.map(({ scaleFactor, dataURL }) => ({ scaleFactor, dataURL })),
     pixmaps: rendered.map(({ pixmap }) => pixmap),
   };
+  compositions.set(key, composed);
+  if (compositions.size > 16) compositions.delete(compositions.keys().next().value!);
+  return composed;
 }

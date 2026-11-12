@@ -1,9 +1,13 @@
+import { trayMenuRows } from "./tray-menu";
 import {
+  DBusError,
   defineInterface,
   sessionBus,
   Variant,
   type ExportRegistration,
   type MessageBus,
+  type Subscription,
+  type DefinedInterface,
 } from "dbus-native";
 
 const ITEM_PATH = "/StatusNotifierItem";
@@ -32,46 +36,86 @@ interface StatusNotifierWatcher {
 
 type MenuLayout = [number, Record<string, Variant>, Variant[]];
 
-function menuProperties(label?: string, enabled = true, type?: string): Record<string, Variant> {
-  const properties: Record<string, Variant> = {};
-  if (label !== undefined) properties.label = new Variant("s", label);
-  if (!enabled) properties.enabled = new Variant("b", false);
-  if (type) properties.type = new Variant("s", type);
-  return properties;
+function menuProperties(label = "", enabled = true, separator = false): Record<string, Variant> {
+  return { label: new Variant("s", label), enabled: new Variant("b", enabled), visible: new Variant("b", true), type: new Variant("s", separator ? "separator" : "standard") };
 }
-
-export function linuxTrayMenuLayout(vault: string): MenuLayout {
-  const item = (id: number, properties: Record<string, Variant>): Variant => new Variant(
-    "(ia{sv}av)",
-    [id, properties, []],
-  );
-  return [0, {}, [
-    item(1, menuProperties(`Vault: ${vault}`, false)),
-    item(2, menuProperties(undefined, true, "separator")),
-    item(3, menuProperties("Show Vault")),
-    item(4, menuProperties("Hide Vault")),
-    item(5, menuProperties("Open Plugin Settings")),
-    item(6, menuProperties(undefined, true, "separator")),
-    item(7, menuProperties("Relaunch Obsidian")),
-    item(8, menuProperties("Close Vault")),
-  ]];
+function filterProperties(properties: Record<string, Variant>, requested: string[]): Record<string, Variant> {
+  return requested.length ? Object.fromEntries(Object.entries(properties).filter(([name]) => requested.includes(name))) : { ...properties };
+}
+export function linuxTrayMenuLayout(vault: string, parentId = 0, depth = -1, requested: string[] = []): MenuLayout {
+  if (parentId === 0) return [0, {}, depth === 0 ? [] : trayMenuRows(vault).map((row) => new Variant("(ia{sv}av)", [row.id, filterProperties(menuProperties(row.label, row.enabled, row.separator), requested), []]))];
+  const row = trayMenuRows(vault).find((item) => item.id === parentId);
+  if (!row) { const error = new DBusError("Unknown menu item"); error.dbusName = "org.freedesktop.DBus.Error.InvalidArgs"; throw error; }
+  return [row.id, filterProperties(menuProperties(row.label, row.enabled, row.separator), requested), []];
 }
 
 export class LinuxStatusNotifierTray {
   private bus?: MessageBus;
   private registrations: ExportRegistration[] = [];
+  private subscription?: Subscription;
+  private itemInterface?: DefinedInterface;
+  private ownerSignal?: string;
+  private disposed = true;
+  private registrationEpoch = 0;
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private available = false;
+  private registrationTail: Promise<void> = Promise.resolve();
+
 
   constructor(
     private readonly vault: string,
-    private readonly pixmaps: ReadonlyArray<LinuxTrayPixmap>,
+    private pixmaps: ReadonlyArray<LinuxTrayPixmap>,
     private readonly actions: LinuxTrayActions,
+    private readonly options: { busFactory?: () => MessageBus; availability?: (available: boolean) => void } = {},
   ) {}
 
+  isAvailable(): boolean { return this.available && !this.disposed; }
+  updateIcon(pixmaps: ReadonlyArray<LinuxTrayPixmap>): void {
+    this.pixmaps = pixmaps;
+    if (this.isAvailable()) this.itemInterface?.emit.NewIcon?.();
+  }
+  private availability(value: boolean): void {
+    if (this.available === value) return;
+    this.available = value; this.options.availability?.(value);
+  }
+  private ownerChanged = (body: unknown[]): void => {
+    if (body[0] !== "org.kde.StatusNotifierWatcher" || this.disposed) return;
+    this.registrationEpoch++; this.availability(false);
+    if (body[2]) this.recoverRegistration();
+  };
+  private disconnected = (): void => { this.registrationEpoch++; this.availability(false); };
+  private reconnected = (): void => this.recoverRegistration();
+  private recoverRegistration(): void {
+    if (this.disposed || !this.bus) return;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    const bus = this.bus;
+    this.registrationTail = this.registrationTail.catch(() => {}).then(() => this.registerWatcher(bus)).catch(() => {
+      if (!this.disposed) this.retryTimer = setTimeout(() => this.recoverRegistration(), 500);
+    });
+  }
+  private async registerWatcher(bus: MessageBus): Promise<void> {
+    const epoch = ++this.registrationEpoch;
+    const watcher = await bus.getInterface<StatusNotifierWatcher>("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher");
+    if (!bus.name) throw new Error("The session bus did not assign a unique name");
+    await watcher.RegisterStatusNotifierItem(bus.name);
+    if (!this.disposed && this.bus === bus && this.registrationEpoch === epoch) this.availability(true);
+  }
+  private menuEvent(id: number, eventId: string): boolean {
+    const row = trayMenuRows(this.vault).find((item) => item.id === id);
+    if (!row) return false;
+    if (eventId !== "clicked") return true;
+    if (!row.enabled || !row.action) return false;
+    this.actions[row.action](); return true;
+  }
+
+
   async create(): Promise<void> {
-    const bus = sessionBus();
+    this.disposed = false;
+    const bus = this.options.busFactory?.() ?? sessionBus({ timeout: 5000, reconnect: true });
     this.bus = bus;
+    try {
     await bus.listNames();
-    const iconPixmaps = this.pixmaps.map(({ width, height, data }) => [width, height, data]);
+    if (this.disposed || this.bus !== bus) throw new Error("Tray creation was cancelled");
     const item = defineInterface({
       name: ITEM_INTERFACE,
       methods: {
@@ -87,7 +131,7 @@ export class LinuxStatusNotifierTray {
         Status: { type: "s", access: "read", value: "Active" },
         WindowId: { type: "u", access: "read", value: 0 },
         IconName: { type: "s", access: "read", value: "" },
-        IconPixmap: { type: "a(iiay)", access: "read", value: iconPixmaps },
+        IconPixmap: { type: "a(iiay)", access: "read", get: () => this.pixmaps.map(({ width, height, data }) => [width, height, data]) },
         OverlayIconName: { type: "s", access: "read", value: "" },
         OverlayIconPixmap: { type: "a(iiay)", access: "read", value: [] },
         AttentionIconName: { type: "s", access: "read", value: "" },
@@ -112,46 +156,36 @@ export class LinuxStatusNotifierTray {
         GetLayout: {
           in: { parentId: "i", recursionDepth: "i", propertyNames: "as" },
           out: { revision: "u", layout: "(ia{sv}av)" },
-          handler: () => ({ revision: 1, layout: linuxTrayMenuLayout(this.vault) }),
+          handler: ({ parentId, recursionDepth, propertyNames }: { parentId: number; recursionDepth: number; propertyNames: string[] }) => ({ revision: 1, layout: linuxTrayMenuLayout(this.vault, parentId, recursionDepth, propertyNames) }),
         },
         GetGroupProperties: {
           in: { ids: "ai", propertyNames: "as" },
           out: { properties: "a(ia{sv})" },
-          handler: () => [],
+          handler: ({ ids, propertyNames }: { ids: number[]; propertyNames: string[] }) => ids.filter((id) => id === 0 || trayMenuRows(this.vault).some((row) => row.id === id)).map((id) => { const layout = linuxTrayMenuLayout(this.vault, id, 0, propertyNames); return [id, id === 0 ? filterProperties(menuProperties(), propertyNames) : layout[1]]; }),
         },
         GetProperty: {
           in: { id: "i", name: "s" },
           out: { value: "v" },
-          handler: () => new Variant("s", ""),
+          handler: ({ id, name }: { id: number; name: string }) => { const value = (id === 0 ? menuProperties() : linuxTrayMenuLayout(this.vault, id, 0)[1])[name]; if (!value) { const error = new DBusError("Unknown menu property"); error.dbusName = "org.freedesktop.DBus.Error.InvalidArgs"; throw error; } return value; },
         },
         Event: {
           in: { id: "i", eventId: "s", data: "v", timestamp: "u" },
-          handler: ({ id, eventId }: { id: number; eventId: string }) => {
-            if (eventId !== "clicked") return;
-            const action = new Map<number, () => void>([
-              [3, () => this.actions.show()],
-              [4, () => this.actions.hide()],
-              [5, () => this.actions.openSettings()],
-              [7, () => this.actions.relaunch()],
-              [8, () => this.actions.closeVault()],
-            ]).get(id);
-            action?.();
-          },
+          handler: ({ id, eventId }: { id: number; eventId: string }) => { if (!this.menuEvent(id, eventId)) { const error = new DBusError("Invalid menu event"); error.dbusName = "org.freedesktop.DBus.Error.InvalidArgs"; throw error; } },
         },
         EventGroup: {
           in: { events: "a(isvu)" },
           out: { idErrors: "ai" },
-          handler: () => [],
+          handler: ({ events }: { events: Array<[number, string, Variant, number]> }) => { const errors: number[] = []; for (const [id, eventId] of events) if (!this.menuEvent(id, eventId)) errors.push(id); return errors; },
         },
         AboutToShow: {
           in: { id: "i" },
           out: { needUpdate: "b" },
-          handler: () => false,
+          handler: ({ id }: { id: number }) => { linuxTrayMenuLayout(this.vault, id, 0); return false; },
         },
         AboutToShowGroup: {
           in: { ids: "ai" },
           out: { updatesNeeded: "ai", idErrors: "ai" },
-          handler: () => ({ updatesNeeded: [], idErrors: [] }),
+          handler: ({ ids }: { ids: number[] }) => ({ updatesNeeded: [], idErrors: ids.filter((id) => id !== 0 && !trayMenuRows(this.vault).some((row) => row.id === id)) }),
         },
       },
       properties: {
@@ -166,20 +200,43 @@ export class LinuxStatusNotifierTray {
         ItemActivationRequested: { args: { id: "i", timestamp: "u" } },
       },
     });
-    this.registrations = [await bus.export(ITEM_PATH, item), await bus.export(MENU_PATH, menu)];
-    const watcher = await bus.getInterface<StatusNotifierWatcher>(
-      "org.kde.StatusNotifierWatcher",
-      "/StatusNotifierWatcher",
-      "org.kde.StatusNotifierWatcher",
-    );
-    if (!bus.name) throw new Error("The session bus did not assign a unique name");
-    await watcher.RegisterStatusNotifierItem(bus.name);
+    this.itemInterface = item;
+    this.registrations.push(await bus.export(ITEM_PATH, item));
+    if (this.disposed || this.bus !== bus) throw new Error("Tray creation was cancelled");
+    this.registrations.push(await bus.export(MENU_PATH, menu));
+    if (this.disposed || this.bus !== bus) throw new Error("Tray creation was cancelled");
+    this.ownerSignal = bus.mangle("/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged");
+    this.subscription = await bus.watch("type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.StatusNotifierWatcher'");
+    if (this.disposed || this.bus !== bus) throw new Error("Tray creation was cancelled");
+    bus.signals.on(this.ownerSignal, this.ownerChanged);
+    bus.connection.on("end", this.disconnected);
+    bus.on("reconnected", this.reconnected);
+    bus.on("reconnectError", this.reconnected);
+    bus.on("error", this.disconnected);
+    await this.registerWatcher(bus);
+    if (this.disposed || this.bus !== bus) throw new Error("Tray creation was cancelled");
+    } catch (error) { await this.dispose(); throw error; }
   }
 
-  destroy(): void {
-    const bus = this.bus;
-    this.bus = undefined;
-    this.registrations = [];
-    if (bus) void bus.close();
+  private async dispose(): Promise<void> {
+    this.disposed = true; this.registrationEpoch++;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.availability(false);
+    const bus = this.bus; this.bus = undefined;
+    if (bus) {
+      if (this.ownerSignal) bus.signals.removeListener(this.ownerSignal, this.ownerChanged);
+      bus.connection.removeListener("end", this.disconnected);
+      bus.removeListener("reconnected", this.reconnected);
+      bus.removeListener("reconnectError", this.reconnected);
+      bus.removeListener("error", this.disconnected);
+    }
+    await this.subscription?.remove().catch(() => {});
+    this.subscription = undefined;
+    this.itemInterface = undefined;
+    for (const registration of this.registrations.splice(0)) await registration.remove().catch(() => {});
+    await bus?.close().catch(() => {});
   }
+
+  destroy(): void { void this.dispose(); }
 }
