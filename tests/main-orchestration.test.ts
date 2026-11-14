@@ -121,8 +121,8 @@ describe("production-bundled coordinator", () => {
   });
   it("suppresses only a proved chooser and restores it before navigation", async () => {
     const fixture = await setup(true), chooser = new VaultWindow(); chooser.webContents.url = "app://obsidian.md/starter.html"; chooser.webContents.chooser = true;
-    fixture.plugin.lastSecondInstanceAt = Date.now(); fixture.plugin.browserWindowCreated({}, chooser); await new Promise(resolve => setTimeout(resolve, 20));
-    expect(chooser.hidden).toBe(true); expect(chooser.skip).toBe(false); chooser.webContents.emit("did-start-navigation"); expect(chooser.hidden).toBe(false); expect(chooser.listenerCount("show")).toBe(0); fixture.plugin.onunload();
+    fixture.plugin.lastSecondInstanceAt = Date.now(); fixture.plugin.browserWindowCreated({}, chooser);
+    await vi.waitFor(() => expect(chooser.hidden).toBe(true)); expect(chooser.skip).toBe(false); chooser.webContents.emit("did-start-navigation"); expect(chooser.hidden).toBe(false); expect(chooser.listenerCount("show")).toBe(0); fixture.plugin.onunload();
   });
   it("returns retained popout maps to their starting size after 100 closes", async () => {
     const fixture = await setup(true), initial = fixture.plugin.backgroundThrottling.size;
