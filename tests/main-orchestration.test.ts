@@ -30,6 +30,8 @@ interface TestPlugin {
   browserWindowCreated(event: unknown, window: VaultWindow): void; track(window: VaultWindow): void;
 }
 let bundle = ""; const roots: string[] = [];
+// These tests model the Electron Tray path (macOS and Windows). On a Linux runner the bundle would take the D-Bus tray path instead.
+const macProcess = new Proxy(process, { get: (target, key) => { if (key === "platform") return "darwin"; const value: unknown = Reflect.get(target, key); return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value; } });
 beforeAll(async () => { const result = await build({ entryPoints: ["src/main.ts"], bundle: true, external: ["obsidian", "electron", "@codemirror/state", "@codemirror/view"], platform: "node", format: "cjs", target: "es2022", minify: true, write: false }); bundle = result.outputFiles[0]!.text; });
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 async function setup(enabled = false) {
@@ -61,7 +63,7 @@ async function setup(enabled = false) {
   const context = { drawImage: () => {}, getImageData: (_x: number, _y: number, width: number, height: number) => ({ data: new Uint8ClampedArray(width * height * 4) }), beginPath: () => {}, roundRect: () => {}, fill: () => {}, scale: () => {}, fillText: () => {} };
   const require = createRequire(join(process.cwd(), "package.json")); const module = { exports: {} };
   const host = Object.assign(new EventEmitter(), { require: () => ({ remote }), setTimeout, clearTimeout, addEventListener: () => {}, removeEventListener: () => {}, open: () => {} });
-  runInNewContext(bundle, { module, exports: module.exports, require: (id: string) => id === "obsidian" ? { Plugin, PluginSettingTab: Tab, Setting: class {}, Notice: class {}, FileSystemAdapter: class {}, normalizePath: (path: string) => path } : require(id) as unknown, window: host, process, Buffer, console, setTimeout, clearTimeout, setImmediate, clearImmediate, AbortController, TextEncoder, atob, Image, createEl: () => ({ width: 0, height: 0, getContext: () => context, toDataURL: () => "data:image/png;base64,iVBORw0KGgo=" }) });
+  runInNewContext(bundle, { module, exports: module.exports, require: (id: string) => id === "obsidian" ? { Plugin, PluginSettingTab: Tab, Setting: class {}, Notice: class {}, FileSystemAdapter: class {}, normalizePath: (path: string) => path } : require(id) as unknown, window: host, process: macProcess, Buffer, console, setTimeout, clearTimeout, setImmediate, clearImmediate, AbortController, TextEncoder, atob, Image, createEl: () => ({ width: 0, height: 0, getContext: () => context, toDataURL: () => "data:image/png;base64,iVBORw0KGgo=" }) });
   const Constructor = (module.exports as { default: new (app: unknown) => TestPlugin }).default;
   const plugin = new Constructor({ vault: { getName: () => "Synthetic", configDir: ".obsidian", adapter: { exists: () => Promise.resolve(false) } }, workspace: { onLayoutReady: (callback: () => void) => callback() } });
   // The adapter remains deliberately non-filesystem: no real vault can enter these tests.
