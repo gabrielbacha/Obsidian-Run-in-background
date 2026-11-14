@@ -8,6 +8,8 @@ without blocking logout, restart, or operating-system shutdown.
   <p>
     <a href="https://www.gabrielbacha.com/?utm_source=obsidian_community&amp;utm_medium=referral&amp;utm_campaign=obsidian_assets&amp;utm_content=run_in_background_readme_header"><strong>Visit gabrielbacha.com</strong></a>
     &nbsp;·&nbsp;
+    <a href="https://www.mindfulapps.xyz/run-in-background/?utm_source=obsidian_community&amp;utm_medium=referral&amp;utm_campaign=obsidian_assets&amp;utm_content=run_in_background_readme_header"><strong>Visit Mindful Apps</strong></a>
+    &nbsp;·&nbsp;
     <a href="https://obsidian.md/plugins?search=Gabriel%20Bacha"><strong>Explore more Obsidian plugins</strong></a>
     &nbsp;·&nbsp;
     <a href="https://github.com/gabrielbacha/Obsidian-Run-in-background/issues/new?template=feature_request.yml"><strong>Request a feature</strong></a>
@@ -201,6 +203,8 @@ used to identify Obsidian and follows the
   <h3>Created by <a href="https://github.com/gabrielbacha">Gabriel Bacha</a></h3>
   <p>
     <a href="https://www.gabrielbacha.com/?utm_source=obsidian_community&amp;utm_medium=referral&amp;utm_campaign=obsidian_assets&amp;utm_content=run_in_background_readme_header"><strong>Visit gabrielbacha.com</strong></a>
+    &nbsp;·&nbsp;
+    <a href="https://www.mindfulapps.xyz/run-in-background/?utm_source=obsidian_community&amp;utm_medium=referral&amp;utm_campaign=obsidian_assets&amp;utm_content=run_in_background_readme_header"><strong>Visit Mindful Apps</strong></a>
     &nbsp;·&nbsp;
     <a href="https://obsidian.md/plugins?search=Gabriel%20Bacha"><strong>Explore more Obsidian plugins</strong></a>
     &nbsp;·&nbsp;
